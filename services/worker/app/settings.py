@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # Increment the version suffix to force a re-fit on the next run.
     scaler_s3_key: str = "artifacts/scalers/features_v1.pkl"
 
+    # S3 key for the full feature-engineering Pipeline (imputer+scaler+OHE).
+    # Increment the version suffix to force a re-fit on the next run.
+    features_pipeline_s3_key: str = "artifacts/pipelines/features_v1.pkl"
+
     @property
     def postgres_dsn(self) -> str:
         return (

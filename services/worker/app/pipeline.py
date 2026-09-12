@@ -12,12 +12,12 @@ Steps
              cyclical encoding, weather join), then Python-fills is_holiday via
              a bulk UPDATE, then asserts row counts and null rates.
 
-3. scaler    On the very first run (no artifact in S3), fit a StandardScaler
-             on the mart table and save it to MinIO.  Every subsequent run
-             skips this step — the scaler is never re-fit automatically.
+3. pipeline  On the very first run (no artifact in S3), fit the feature-
+             engineering Pipeline (imputer + scaler + OHE) on the mart table
+             and save it to MinIO.  Every subsequent run skips this step.
 
-Scaler re-fit
--------------
+Pipeline re-fit
+---------------
 To force a re-fit after a distribution shift (e.g. new cities, seasonality
 change), delete the S3 artifact and run the pipeline once manually:
 
@@ -37,8 +37,8 @@ from botocore.exceptions import ClientError
 
 from common.s3 import make_s3_client
 
+from .features.pipeline import ALL_FEATURE_COLS, fit_pipeline, save_pipeline
 from .marts import run_marts
-from .scaler import SCALE_COLS, ScalerTrainer
 from .settings import Settings
 from .staging import run_staging
 
@@ -56,7 +56,7 @@ def run_pipeline(settings: Settings) -> None:
     try:
         run_staging(settings)
         run_marts(settings)
-        _maybe_fit_scaler(settings)
+        _maybe_fit_features_pipeline(settings)
         log.info("pipeline_run_completed")
     except Exception:
         log.exception("pipeline_run_failed")
@@ -64,58 +64,48 @@ def run_pipeline(settings: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scaler bootstrap (first-run only)
+# Feature pipeline bootstrap (first-run only)
 # ---------------------------------------------------------------------------
 
-def _maybe_fit_scaler(settings: Settings) -> None:
-    """
-    Fit a StandardScaler on the mart table and persist to MinIO — but only
-    if the artifact does not already exist.
+def _maybe_fit_features_pipeline(settings: Settings) -> None:
+    """Fit the feature Pipeline on the mart table and persist to MinIO.
 
-    The S3 object acts as a distributed lock: once present, the scaler is
-    never replaced by normal pipeline runs.  This guarantees that the scaler
-    statistics always reflect the original training distribution rather than
-    drifting silently with each incremental run.
+    Skips if the artifact already exists — the S3 object acts as a
+    distributed lock so the fitted statistics never drift on incremental runs.
+
+    To force a re-fit after a distribution shift, delete the artifact and
+    run once manually (``make worker-pipeline``).
     """
-    s3 = make_s3_client(settings)
+    s3     = make_s3_client(settings)
     bucket = settings.lake_bucket
-    key    = settings.scaler_s3_key
+    key    = settings.features_pipeline_s3_key
 
     try:
         s3.head_object(Bucket=bucket, Key=key)
-        log.debug("scaler_artifact_exists_skipping", key=key)
+        log.debug("features_pipeline_artifact_exists_skipping", key=key)
         return
     except ClientError as exc:
-        code = exc.response["Error"]["Code"]
-        if code not in ("404", "NoSuchKey"):
+        if exc.response["Error"]["Code"] not in ("404", "NoSuchKey"):
             raise   # unexpected error (permissions, network) — propagate
 
-    # Artifact absent → fit on the current mart table.
-    log.info("scaler_fitting_started", bucket=bucket, key=key)
+    log.info("features_pipeline_fitting_started", bucket=bucket, key=key)
 
     conn = psycopg2.connect(settings.postgres_dsn)
     try:
-        features_df = pd.read_sql(
-            f"SELECT {', '.join(SCALE_COLS)} FROM marts.city_hour_features",
+        df = pd.read_sql(
+            f"SELECT {', '.join(ALL_FEATURE_COLS)} FROM marts.city_hour_features",
             conn,
         )
     finally:
         conn.close()
 
-    if features_df.empty:
-        log.warning("scaler_skipped", reason="marts.city_hour_features is empty")
+    if df.empty:
+        log.warning("features_pipeline_skipped", reason="marts.city_hour_features is empty")
         return
 
-    trainer = ScalerTrainer()
-    fitted  = trainer.fit(features_df, feature_cols=SCALE_COLS)
-    trainer.save(fitted, s3, bucket, key)
-
-    log.info(
-        "scaler_saved",
-        key=key,
-        n_train_rows=len(features_df.dropna()),
-        means={k: round(float(v), 4) for k, v in fitted.feature_means().items()},
-    )
+    fitted = fit_pipeline(df)
+    save_pipeline(fitted, s3, bucket, key)
+    log.info("features_pipeline_artifact_saved", key=key, n_rows=len(df))
 
 
 # ---------------------------------------------------------------------------
