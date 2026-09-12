@@ -44,7 +44,7 @@ and the migration — this file does not need editing.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg2
@@ -106,14 +106,20 @@ def run_feature_store(settings: Settings) -> None:
 def _run_route_mart(settings: Settings) -> None:
     """Execute sql/feature_store/001_route_features_daily.sql.
 
-    The SQL computes features for CURRENT_DATE - 1 and upserts into
+    Computes features for yesterday (date.today() - 1 day) and upserts into
     marts.route_features_daily.  Running it twice on the same day is safe
     (ON CONFLICT DO UPDATE overwrites with identical values).
+
+    The feature_date parameter anchors all lookback windows so that the SQL
+    is point-in-time correct and safe to re-run for any past date.
     """
-    log.info("route_mart_started")
+    feature_date = date.today() - timedelta(days=1)
+    log.info("route_mart_started", feature_date=feature_date.isoformat())
     conn = psycopg2.connect(settings.postgres_dsn)
     try:
-        results = SqlRunner(_SQL_DIR).run(conn, params={})
+        results = SqlRunner(_SQL_DIR).run(
+            conn, params={"feature_date": feature_date.isoformat()}
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -124,6 +130,7 @@ def _run_route_mart(settings: Settings) -> None:
     result = results[0] if results else {}
     log.info(
         "route_mart_done",
+        feature_date=feature_date.isoformat(),
         routes_assembled=int(result.get("routes_assembled", 0) or 0),
         routes_upserted=int(result.get("routes_upserted", 0) or 0),
     )

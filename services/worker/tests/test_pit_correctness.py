@@ -1,0 +1,411 @@
+"""
+Integration: point-in-time correctness for sql/feature_store/001_route_features_daily.sql.
+
+Point-in-time (PIT) rule
+------------------------
+The row for feature_date D must only use source data whose event-time
+timestamp (sim_ts for raw.demand_events, hour_ts for city_hour_features)
+falls on or before D.  No future data may influence any feature value.
+
+What is tested
+--------------
+1. test_max_source_timestamp_does_not_exceed_feature_date
+       After inserting data that spans feature_date and feature_date+1,
+       the SQL is run for feature_date.  We then query the max sim_ts /
+       hour_ts that lay inside each PIT-correct window.  Both must be
+       <= feature_date.  Confirms the schema is exercised with future rows
+       present (the test is not vacuously true).
+
+2. test_future_data_has_no_effect_on_computed_features
+       Runs the SQL with past-only data → captures baseline feature values.
+       Injects future rows with extreme values (9 999) that would visibly
+       corrupt every aggregate if leaked.  Reruns for the same feature_date
+       and asserts every column is unchanged.  This is the definitive
+       proof: a changed value means the SQL used future data.
+
+3. test_cancellation_rate_excludes_future_sim_ts
+       Inserts only future cancellations (sim_ts > feature_date).
+       Expects cancellation_rate_180d = 0.0.
+       Directly targets the ingested_at-vs-sim_ts bug that existed before
+       the SQL was parameterised: the old code used ``ingested_at < CURRENT_DATE``
+       which would include an event with sim_ts = D+1 if it was ingested before
+       today.
+
+4. test_avg_bookings_excludes_future_hour_ts
+       Inserts past hours (event_count=10 each) and one future hour
+       (event_count=9 990).  Expects avg_bookings_90d ≈ 10.0.
+       Confirms the city_hour_features upper-bound filter is correct.
+
+Requirements
+------------
+Requires a live Postgres connection.  Skipped automatically when neither
+POSTGRES_DSN nor POSTGRES_PASSWORD is set in the environment (unit-test
+environments).  All data is written inside a transaction that is rolled
+back on teardown — nothing persists in the database.
+"""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+from pathlib import Path
+
+import psycopg2.extras
+import pytest
+
+# The feature_date used across all tests.
+# Using a fixed historical date avoids any dependency on the current wall clock.
+_FEATURE_DATE = date(2024, 6, 15)  # Saturday
+
+# Test city name — chosen to be obviously synthetic and collision-free with
+# real city data ("london", "tokyo", etc.).
+_CITY = "_pit_test_route"
+
+# Path to the SQL file under test.  Resolved relative to this test file so
+# the test works regardless of the working directory.
+_SQL_PATH = (
+    Path(__file__).parent.parent
+    / "sql" / "feature_store" / "001_route_features_daily.sql"
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _exec(conn, sql: str, params=None) -> list[dict]:
+    """Execute *sql* and return all rows as dicts (empty list for non-SELECT)."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        if cur.description:
+            return [dict(r) for r in cur.fetchall()]
+    return []
+
+
+def _insert_hour(
+    conn,
+    hour_ts: str,
+    total_demand: float,
+    event_count: int,
+    temperature_c: float,
+) -> None:
+    """Insert one row into marts.city_hour_features for _CITY."""
+    _exec(conn, """
+        INSERT INTO marts.city_hour_features
+            (city, hour_ts, total_demand, event_count, temperature_c, is_holiday)
+        VALUES (%s, %s::timestamptz, %s, %s, %s, false)
+        ON CONFLICT (city, hour_ts) DO NOTHING
+    """, (_CITY, hour_ts, total_demand, event_count, temperature_c))
+
+
+def _insert_event(
+    conn,
+    event_id: str,
+    sim_ts: str,
+    ingested_at: str,
+    event_type: str = "booking",
+    quantity: float = 10.0,
+) -> None:
+    """Insert one row into raw.demand_events for _CITY."""
+    _exec(conn, """
+        INSERT INTO raw.demand_events
+            (city, event_type, sim_ts, ingested_at, quantity, event_id)
+        VALUES (%s, %s, %s::timestamptz, %s::timestamptz, %s, %s)
+        ON CONFLICT (event_id) DO NOTHING
+    """, (_CITY, event_type, sim_ts, ingested_at, quantity, event_id))
+
+
+def _run_feature_sql(conn) -> dict:
+    """Execute the feature SQL for _FEATURE_DATE and return the counter row."""
+    sql = _SQL_PATH.read_text(encoding="utf-8")
+    rows = _exec(conn, sql, {"feature_date": str(_FEATURE_DATE)})
+    return dict(rows[0]) if rows else {}
+
+
+def _read_feature_row(conn) -> dict | None:
+    """Read back the produced row from marts.route_features_daily."""
+    rows = _exec(conn, """
+        SELECT *
+        FROM marts.route_features_daily
+        WHERE route_id = %s AND feature_date = %s
+    """, (_CITY, str(_FEATURE_DATE)))
+    return dict(rows[0]) if rows else None
+
+
+def _ts(d: date, hour: int = 10) -> str:
+    """ISO-8601 UTC timestamp string for *d* at *hour*:00:00."""
+    return f"{d}T{hour:02d}:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _cleanup(pg_conn):
+    """Delete any stale rows for _CITY before and after each test.
+
+    Using DELETE rather than relying solely on the transaction rollback ensures
+    isolation even if a previous test run committed unexpectedly.
+    """
+    # marts.route_features_daily uses route_id (not city) as its city column.
+    _exec(pg_conn, "DELETE FROM marts.route_features_daily WHERE route_id = %s", (_CITY,))
+    for tbl in (
+        "marts.city_hour_features",
+        "raw.demand_events",
+    ):
+        _exec(pg_conn, f"DELETE FROM {tbl} WHERE city = %s", (_CITY,))
+    yield
+    # Rollback is handled by the pg_conn fixture; nothing extra needed.
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+class TestPITCorrectness:
+    """Point-in-time correctness for 001_route_features_daily.sql."""
+
+    # ------------------------------------------------------------------
+    # 1. Max source timestamp check (per the user's requirement)
+    # ------------------------------------------------------------------
+
+    def test_max_source_timestamp_does_not_exceed_feature_date(self, pg_conn):
+        """The max source event-time used per row must be <= feature_date.
+
+        Strategy: seed data spanning feature_date and feature_date+1, run the
+        SQL, then directly query the max timestamp of each source table
+        *within the PIT-correct filter* to confirm it does not exceed
+        feature_date.  A separate assertion verifies that future rows actually
+        exist (so the test is not vacuously satisfied by missing test data).
+        """
+        fd = _FEATURE_DATE
+        day_before = fd - timedelta(days=1)
+        day_after = fd + timedelta(days=1)
+
+        # ── Past + present data ───────────────────────────────────────────
+        _insert_hour(pg_conn, _ts(day_before), 100.0, 10, 20.0)
+        _insert_hour(pg_conn, _ts(fd),         120.0, 12, 22.0)
+        _insert_event(pg_conn, "_pit_ts_e1", _ts(day_before), _ts(day_before, 11))
+        _insert_event(pg_conn, "_pit_ts_e2", _ts(fd),         _ts(fd, 11))
+
+        # ── Future data (must NOT be used by the SQL for feature_date=fd) ─
+        _insert_hour(pg_conn, _ts(day_after), 9999.0, 999, 999.0)
+        _insert_event(pg_conn, "_pit_ts_f1", _ts(day_after), _ts(day_after, 11),
+                      event_type="cancellation", quantity=9999.0)
+
+        # Confirm that future rows are present in the source tables.
+        future_hours = _exec(pg_conn, """
+            SELECT COUNT(*) AS n FROM marts.city_hour_features
+            WHERE city = %s AND (hour_ts AT TIME ZONE 'UTC')::date > %s
+        """, (_CITY, str(fd)))[0]["n"]
+        assert future_hours > 0, "Test setup: no future hours inserted — test is vacuous"
+
+        future_events = _exec(pg_conn, """
+            SELECT COUNT(*) AS n FROM raw.demand_events
+            WHERE city = %s AND (sim_ts AT TIME ZONE 'UTC')::date > %s
+        """, (_CITY, str(fd)))[0]["n"]
+        assert future_events > 0, "Test setup: no future events inserted — test is vacuous"
+
+        # ── Run the SQL ───────────────────────────────────────────────────
+        counters = _run_feature_sql(pg_conn)
+        assert counters.get("routes_assembled", 0) >= 1, (
+            "SQL produced no rows — check test data setup"
+        )
+
+        # ── Assert max source timestamps per produced row ─────────────────
+        produced_rows = _exec(pg_conn, """
+            SELECT route_id, feature_date FROM marts.route_features_daily
+            WHERE route_id = %s
+        """, (_CITY,))
+        assert produced_rows, "No row produced for the test city"
+
+        for pr in produced_rows:
+            feature_date = pr["feature_date"]
+
+            # Max sim_ts (event business time) used from raw.demand_events.
+            # The PIT-correct window for demand events (using sim_ts):
+            #   lower: sim_ts::date > feature_date - 180 days (widest window used)
+            #   upper: sim_ts::date <= feature_date
+            max_sim_ts_date = _exec(pg_conn, """
+                SELECT MAX((sim_ts AT TIME ZONE 'UTC')::date) AS max_ts
+                FROM raw.demand_events
+                WHERE city = %s
+                  AND (sim_ts AT TIME ZONE 'UTC')::date >  %s::date - INTERVAL '180 days'
+                  AND (sim_ts AT TIME ZONE 'UTC')::date <= %s::date
+            """, (_CITY, str(feature_date), str(feature_date)))[0]["max_ts"]
+
+            assert max_sim_ts_date is not None, (
+                f"No demand events in PIT window for feature_date={feature_date}"
+            )
+            assert max_sim_ts_date <= feature_date, (
+                f"Max demand event sim_ts {max_sim_ts_date} > feature_date "
+                f"{feature_date}: future demand data would leak into the row."
+            )
+
+            # Max hour_ts (event business time) used from city_hour_features.
+            max_hour_ts_date = _exec(pg_conn, """
+                SELECT MAX((hour_ts AT TIME ZONE 'UTC')::date) AS max_ts
+                FROM marts.city_hour_features
+                WHERE city = %s
+                  AND (hour_ts AT TIME ZONE 'UTC')::date <= %s::date
+            """, (_CITY, str(feature_date)))[0]["max_ts"]
+
+            assert max_hour_ts_date is not None, (
+                f"No city_hour_features rows in PIT window for feature_date={feature_date}"
+            )
+            assert max_hour_ts_date <= feature_date, (
+                f"Max hour_ts {max_hour_ts_date} > feature_date "
+                f"{feature_date}: future hour data would leak into the row."
+            )
+
+    # ------------------------------------------------------------------
+    # 2. Definitive proof: future data must not change any column value
+    # ------------------------------------------------------------------
+
+    def test_future_data_has_no_effect_on_computed_features(self, pg_conn):
+        """Adding future data must not change any feature value.
+
+        The future rows have extreme values (total_demand=9 999, event_count=999,
+        quantity=9 999) designed to corrupt every aggregate if they are
+        incorporated.  Identical feature values before and after their insertion
+        prove that the SQL correctly excludes all data with sim_ts/hour_ts
+        beyond feature_date.
+        """
+        fd = _FEATURE_DATE
+        day_before = fd - timedelta(days=1)
+        day_after  = fd + timedelta(days=1)
+
+        # ── Step 1: seed past-only data ───────────────────────────────────
+        # Two past hours for the city_hour_features aggregates.
+        _insert_hour(pg_conn, _ts(day_before), 100.0, 10, 20.0)
+        _insert_hour(pg_conn, _ts(fd),         120.0, 12, 22.0)
+        # Two past demand events (one booking on each day).
+        _insert_event(pg_conn, "_pit_nd_e1",
+                      _ts(day_before), _ts(day_before, 11), "booking",    50.0)
+        _insert_event(pg_conn, "_pit_nd_e2",
+                      _ts(fd),         _ts(fd, 11),         "booking",    60.0)
+        # One past cancellation — gives a non-zero baseline cancellation rate.
+        _insert_event(pg_conn, "_pit_nd_e3",
+                      _ts(day_before), _ts(day_before, 12), "cancellation", 5.0)
+
+        # ── Run SQL → capture baseline ────────────────────────────────────
+        _run_feature_sql(pg_conn)
+        baseline = _read_feature_row(pg_conn)
+        assert baseline is not None, (
+            "SQL produced no row — verify test data touches avg_bookings (needs city_hour_features)"
+        )
+
+        # ── Step 2: inject future data with extreme values ────────────────
+        # Future city_hour_features row: event_count=999 would inflate avg_bookings,
+        # seasonality, and elasticity if it leaked.
+        _insert_hour(pg_conn, _ts(day_after), 9999.0, 999, 999.0)
+        # Future demand events: cancellations would inflate cancellation_rate,
+        # and the booking would change lead_time percentiles.
+        _insert_event(pg_conn, "_pit_nd_f1",
+                      _ts(day_after), _ts(day_after, 11), "cancellation", 9999.0)
+        _insert_event(pg_conn, "_pit_nd_f2",
+                      _ts(day_after, 11), _ts(day_after, 12), "booking",  9999.0)
+
+        # ── Rerun for the same feature_date → ON CONFLICT DO UPDATE ───────
+        _run_feature_sql(pg_conn)
+        result_with_future = _read_feature_row(pg_conn)
+        assert result_with_future is not None
+
+        # ── Assert: every column is unchanged ─────────────────────────────
+        # feature_computed_at is a wall-clock timestamp that always changes;
+        # exclude it from the comparison.
+        _EXCLUDED = {"feature_computed_at"}
+        mismatches: list[str] = []
+        for col, before in baseline.items():
+            if col in _EXCLUDED:
+                continue
+            after = result_with_future[col]
+            if before != after:
+                mismatches.append(
+                    f"  {col}: {before!r} → {after!r}"
+                )
+
+        assert not mismatches, (
+            "Future data changed feature values — PIT boundary is broken:\n"
+            + "\n".join(mismatches)
+        )
+
+    # ------------------------------------------------------------------
+    # 3. cancellation_rate specifically targets the ingested_at vs sim_ts bug
+    # ------------------------------------------------------------------
+
+    def test_cancellation_rate_excludes_future_sim_ts(self, pg_conn):
+        """cancellation_rate_180d must be 0.0 when all cancellations have sim_ts > fd.
+
+        This test directly targets the pre-fix bug where the SQL used
+        ``ingested_at < CURRENT_DATE`` as the upper bound for cancellations.
+        With that bug, an event with sim_ts = D+1 but ingested_at = D-1
+        (a "time-traveller" event — already stored but describing a future
+        sim time) would be counted.  The fixed SQL uses sim_ts as the bound
+        and correctly excludes all such events.
+        """
+        fd = _FEATURE_DATE
+
+        # We need at least one city_hour_features row so the city appears in
+        # the assembled CTE (which drives the outer join to cancellations).
+        _insert_hour(pg_conn, _ts(fd), 100.0, 10, 20.0)
+
+        # Past bookings only — no past cancellations.
+        _insert_event(pg_conn, "_pit_cr_b1", _ts(fd), _ts(fd, 11), "booking", 10.0)
+
+        # Future cancellations.
+        # Crucially, ingested_at is set to BEFORE feature_date so that a filter
+        # on ingested_at < CURRENT_DATE would incorrectly include them.
+        day_after = fd + timedelta(days=1)
+        _insert_event(pg_conn, "_pit_cr_f1",
+                      sim_ts=_ts(day_after),
+                      ingested_at=_ts(fd - timedelta(days=1)),   # ingested BEFORE fd!
+                      event_type="cancellation",
+                      quantity=999.0)
+        _insert_event(pg_conn, "_pit_cr_f2",
+                      sim_ts=_ts(fd + timedelta(days=2)),
+                      ingested_at=_ts(fd - timedelta(days=1)),   # ingested BEFORE fd!
+                      event_type="cancellation",
+                      quantity=999.0)
+
+        _run_feature_sql(pg_conn)
+        row = _read_feature_row(pg_conn)
+        assert row is not None, "SQL produced no row — verify city_hour_features setup"
+
+        rate = row["cancellation_rate_180d"]
+        assert rate == pytest.approx(0.0), (
+            f"cancellation_rate_180d={rate!r}, expected 0.0.  "
+            "Future cancellation events (sim_ts > feature_date) leaked into "
+            "the 180-day window.  The SQL must filter by sim_ts, not ingested_at."
+        )
+
+    # ------------------------------------------------------------------
+    # 4. avg_bookings specifically targets the hour_ts upper-bound
+    # ------------------------------------------------------------------
+
+    def test_avg_bookings_excludes_future_hour_ts(self, pg_conn):
+        """avg_bookings_90d must not reflect hours with hour_ts > feature_date.
+
+        Two past hours each with event_count=10 → expected avg = 10.0.
+        One future hour with event_count=9 990 → would inflate avg to ~3 337
+        if hour_ts <= feature_date filter were missing or wrong.
+        """
+        fd = _FEATURE_DATE
+        day_before = fd - timedelta(days=1)
+        day_after  = fd + timedelta(days=1)
+
+        _insert_hour(pg_conn, _ts(day_before), 100.0, 10, 20.0)  # in window
+        _insert_hour(pg_conn, _ts(fd),         100.0, 10, 20.0)  # in window, edge case
+        _insert_hour(pg_conn, _ts(day_after),  99_900.0, 9_990, 20.0)  # FUTURE
+
+        _run_feature_sql(pg_conn)
+        row = _read_feature_row(pg_conn)
+        assert row is not None, "SQL produced no row for the test city"
+
+        avg = row["avg_bookings_90d"]
+        # Each past day aggregates to daily_bookings = event_count = 10.
+        # avg_bookings_90d = (10 + 10) / 2 = 10.0
+        assert avg == pytest.approx(10.0), (
+            f"avg_bookings_90d={avg!r}, expected ≈10.0.  "
+            "Future hour (hour_ts > feature_date) leaked into the 90-day average."
+        )

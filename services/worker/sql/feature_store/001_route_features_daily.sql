@@ -1,11 +1,10 @@
 -- 001_route_features_daily.sql
--- Compute route-level features for CURRENT_DATE - 1 and upsert into
+-- Compute route-level features for %(feature_date)s and upsert into
 -- marts.route_features_daily.
 --
 -- This file lives in sql/feature_store/ (not sql/marts/) so run_marts()
--- never runs it.  It is executed by feature_store.run_route_mart() with
--- params={} — no substitution parameters are needed because the reference
--- date is always CURRENT_DATE - 1 (yesterday as of batch run time).
+-- never runs it.  It is executed by feature_store._run_route_mart() with
+-- params={"feature_date": "YYYY-MM-DD"}.
 --
 -- Route identity
 -- --------------
@@ -13,42 +12,48 @@
 -- therefore ``city``.  When the data model grows to include explicit
 -- origin/destination pairs, change the alias here and add a migration.
 --
--- Window semantics
--- ----------------
--- All lookback windows use strict ``< CURRENT_DATE`` on the upper bound so
--- today's partial-day data is never included in a historical aggregate.
--- This prevents data leakage into features that are subsequently used to
--- train models or serve forecasts.
+-- Point-in-time (PIT) correctness
+-- ---------------------------------
+-- The row for feature_date D must only use data whose source timestamp
+-- falls on or before D.  All lookback windows are anchored to the params
+-- CTE, never to CURRENT_DATE, so this SQL is safe to run for any date
+-- (live production, backfills, reruns after bugs).
+--
+-- The critical rule: window boundaries use sim_ts (event business time),
+-- NOT ingested_at (database arrival time).  Using ingested_at leaks future
+-- events that were late-arriving in the source feed: an event with
+-- sim_ts = D+1 but ingested_at = D-1 would appear in the D window if
+-- filtered by ingested_at, but is correctly excluded when filtered by sim_ts.
 --
 -- Feature: avg_bookings_90d
 -- -------------------------
 -- Average of daily booking counts (event_count aggregated to date) over the
--- 90 calendar days that end one day before CURRENT_DATE.
+-- 90 calendar days ending on feature_date (exclusive lower bound so that
+-- exactly 90 days of history are included).
 -- NULL when no data exists in the window.
 --
 -- Feature: seasonality_{dow}
 -- --------------------------
 -- For each ISO weekday 1-Mon … 7-Sun: (avg demand on that DOW) / (route
--- overall avg daily demand).  Pivot is done with MAX(...) FILTER (WHERE dow=N)
--- which is the standard PostgreSQL conditional aggregation pattern.
+-- overall avg daily demand).  Pivot is done with MAX(...) FILTER (WHERE dow=N).
 -- NULL for any DOW that has never appeared in the historical data.
 --
 -- Feature: lead_time_p50 / lead_time_p90
 -- ----------------------------------------
--- PERCENTILE_CONT applied to (ingested_at - sim_ts) in hours.  Negative
--- lead times (clock skew or SIM_SPEED artefacts) are excluded.  Window:
--- 90 days before CURRENT_DATE.
+-- PERCENTILE_CONT applied to (ingested_at - sim_ts) in hours.  Window is
+-- the 90 calendar days of sim_ts ending on feature_date.  Negative lead
+-- times (clock skew or SIM_SPEED artefacts) are excluded.
 --
 -- Feature: cancellation_rate_180d
 -- --------------------------------
--- Fraction of events with event_type = 'cancellation' over 180 days.
--- Defaults to 0.0 when no events match (COALESCE on the LEFT JOIN).
+-- Fraction of events with event_type = 'cancellation' over the 180-day
+-- sim_ts window ending on feature_date.
 --
 -- Feature: elasticity_estimate
 -- -----------------------------
--- Pearson r between temperature_c and total_demand over all history before
--- CURRENT_DATE.  CORR() is a SQL standard aggregate; it returns NULL when
--- fewer than 2 non-null pairs exist.
+-- Pearson r between temperature_c and total_demand over all history
+-- up to and including feature_date.  CORR() returns NULL when fewer than
+-- 2 non-null pairs exist.
 --
 -- Returns one row:
 --   routes_assembled BIGINT — rows in the assembled CTE
@@ -56,7 +61,18 @@
 
 WITH
 
+-- ── Reference date ────────────────────────────────────────────────────────
+-- All CTEs derive their window bounds from this single value.
+-- Using a CTE avoids repeating the cast throughout the query and makes
+-- point-in-time semantics explicit: every window closes at fd (inclusive).
+params AS (
+    SELECT %(feature_date)s::date AS fd
+),
+
 -- ── Daily demand per route ────────────────────────────────────────────────
+-- Source: marts.city_hour_features (hour_ts = sim_ts truncated to the hour).
+-- Upper bound: hour_ts::date <= fd  — no future hours included.
+-- No lower bound here; avg_bookings applies the 90-day window below.
 daily AS (
     SELECT
         city                                    AS route_id,
@@ -65,7 +81,7 @@ daily AS (
         SUM(event_count)                        AS daily_bookings
     FROM marts.city_hour_features
     WHERE total_demand IS NOT NULL
-      AND (hour_ts AT TIME ZONE 'UTC')::date < CURRENT_DATE
+      AND (hour_ts AT TIME ZONE 'UTC')::date <= (SELECT fd FROM params)
     GROUP BY city, (hour_ts AT TIME ZONE 'UTC')::date
 ),
 
@@ -75,7 +91,7 @@ avg_bookings AS (
         route_id,
         AVG(daily_bookings) AS avg_bookings_90d
     FROM daily
-    WHERE day >= CURRENT_DATE - INTERVAL '90 days'
+    WHERE day > (SELECT fd FROM params) - INTERVAL '90 days'
     GROUP BY route_id
 ),
 
@@ -113,7 +129,15 @@ seasonality AS (
 ),
 
 -- ── Lead time percentiles (hours), last 90 days ───────────────────────────
--- Negative lead times arise from SIM_SPEED artefacts and are excluded.
+-- Window is by sim_ts (event business time), NOT ingested_at.
+--
+-- Why sim_ts?  ingested_at filters by when rows arrived in Postgres, not by
+-- when the event happened.  High SIM_SPEED means sim_ts can be days ahead of
+-- ingested_at; using ingested_at for the upper bound would silently include
+-- events whose sim_ts > feature_date.  That is future leakage.
+--
+-- Negative lead times (ingested_at < sim_ts, caused by SIM_SPEED artefacts
+-- or clock skew) are excluded; they represent data-quality noise.
 lead_times AS (
     SELECT
         city AS route_id,
@@ -126,30 +150,31 @@ lead_times AS (
     FROM raw.demand_events
     WHERE sim_ts     IS NOT NULL
       AND ingested_at IS NOT NULL
-      AND ingested_at >= CURRENT_DATE - INTERVAL '90 days'
-      AND ingested_at <  CURRENT_DATE
+      AND (sim_ts AT TIME ZONE 'UTC')::date >  (SELECT fd FROM params) - INTERVAL '90 days'
+      AND (sim_ts AT TIME ZONE 'UTC')::date <= (SELECT fd FROM params)
       AND EXTRACT(EPOCH FROM (ingested_at - sim_ts)) >= 0
     GROUP BY city
 ),
 
 -- ── Cancellation rate, last 180 days ─────────────────────────────────────
--- event_type = 'cancellation' identifies cancelled demand events.
--- COALESCE(…, 0.0) on the outer join gives 0 for routes with no cancellations
--- rather than NULL.
+-- Window is by sim_ts for the same reason as lead_times above.
+-- COALESCE(…, 0.0) is applied in assembled (via LEFT JOIN) rather than here
+-- so that routes with no demand events at all are handled correctly.
 cancellations AS (
     SELECT
         city AS route_id,
         SUM(CASE WHEN event_type = 'cancellation' THEN 1.0 ELSE 0.0 END)
             / NULLIF(COUNT(*), 0)               AS cancellation_rate_180d
     FROM raw.demand_events
-    WHERE ingested_at >= CURRENT_DATE - INTERVAL '180 days'
-      AND ingested_at <  CURRENT_DATE
+    WHERE (sim_ts AT TIME ZONE 'UTC')::date >  (SELECT fd FROM params) - INTERVAL '180 days'
+      AND (sim_ts AT TIME ZONE 'UTC')::date <= (SELECT fd FROM params)
     GROUP BY city
 ),
 
 -- ── Elasticity: Pearson r(temperature_c, total_demand) ───────────────────
--- Computed over all available history so the estimate is as stable as possible.
--- CORR() returns NULL with < 2 non-null pairs.
+-- Computed over all available history up to and including feature_date so
+-- the estimate is as stable as possible.  CORR() returns NULL with < 2
+-- non-null pairs.
 elasticity AS (
     SELECT
         city AS route_id,
@@ -160,7 +185,7 @@ elasticity AS (
     FROM marts.city_hour_features
     WHERE temperature_c IS NOT NULL
       AND total_demand   IS NOT NULL
-      AND (hour_ts AT TIME ZONE 'UTC')::date < CURRENT_DATE
+      AND (hour_ts AT TIME ZONE 'UTC')::date <= (SELECT fd FROM params)
     GROUP BY city
 ),
 
@@ -168,7 +193,7 @@ elasticity AS (
 assembled AS (
     SELECT
         ab.route_id,
-        (CURRENT_DATE - 1)                      AS feature_date,
+        (SELECT fd FROM params)                 AS feature_date,
         ab.avg_bookings_90d,
         s.seasonality_mon,
         s.seasonality_tue,
