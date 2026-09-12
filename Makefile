@@ -1,13 +1,12 @@
 COMPOSE := docker compose
 
 # Profile flag helpers
-P_CORE        := --profile core
-P_STREAMING   := --profile streaming
-P_STORAGE     := --profile storage
-P_ML          := --profile ml
-P_OBS         := --profile observability
-P_APP         := --profile app
-P_ALL         := $(P_CORE) $(P_STREAMING) $(P_STORAGE) $(P_ML) $(P_OBS) $(P_APP)
+P_CORE   := --profile core
+P_STREAM := --profile stream
+P_ML     := --profile ml
+P_OBS    := --profile obs
+P_UI     := --profile ui
+P_ALL    := $(P_CORE) $(P_STREAM) $(P_ML) $(P_OBS) $(P_UI)
 
 .DEFAULT_GOAL := help
 
@@ -26,25 +25,21 @@ help: ## List available targets
 up: ## Start core services (postgres, redis)
 	$(COMPOSE) $(P_CORE) up -d
 
-.PHONY: up-streaming
-up-streaming: ## Start streaming services (redpanda)
-	$(COMPOSE) $(P_STREAMING) up -d
-
-.PHONY: up-storage
-up-storage: ## Start storage services (minio, clickhouse)
-	$(COMPOSE) $(P_STORAGE) up -d
+.PHONY: up-stream
+up-stream: ## Start streaming services (redpanda)
+	$(COMPOSE) $(P_STREAM) up -d
 
 .PHONY: up-ml
-up-ml: ## Start ML services (mlflow)
+up-ml: ## Start ML services (clickhouse, minio, mlflow)
 	$(COMPOSE) $(P_ML) up -d
 
 .PHONY: up-obs
 up-obs: ## Start observability services (prometheus, grafana)
 	$(COMPOSE) $(P_OBS) up -d
 
-.PHONY: up-app
-up-app: ## Start application services (api, ingestion, forecaster, frontend)
-	$(COMPOSE) $(P_APP) up -d
+.PHONY: up-ui
+up-ui: ## Start application services (api, ingestion, forecaster, frontend)
+	$(COMPOSE) $(P_UI) up -d
 
 .PHONY: up-all
 up-all: ## Start all services
@@ -79,9 +74,13 @@ logs-%: ## Tail logs for a specific service  (e.g. make logs-postgres)
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
+.PHONY: build-base
+build-base: ## Build the shared Python base image (forecast-base:latest)
+	docker build -f libs/Dockerfile.base -t forecast-base:latest .
+
 .PHONY: build
-build: ## Build all application images
-	$(COMPOSE) $(P_APP) build
+build: build-base ## Build all application images (rebuilds base first)
+	$(COMPOSE) $(P_UI) build
 
 .PHONY: build-%
 build-%: ## Build a specific service image  (e.g. make build-api)
