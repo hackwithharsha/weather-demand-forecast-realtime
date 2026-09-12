@@ -63,6 +63,19 @@ services:
       retries: 3
       start_period: 15s
 
+  event-generator:
+    build:
+      context: .
+      dockerfile: services/event-generator/Dockerfile
+    profiles: [core]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CITIES:          ${GENERATOR_CITIES:-london,new_york,tokyo,sydney,dubai}
+      TICK_INTERVAL_S: ${GENERATOR_TICK_INTERVAL_S:-1.0}
+      SIM_SPEED:       ${GENERATOR_SIM_SPEED:-3600.0}
+      SIM_START:       ${GENERATOR_SIM_START:-}
+
   # ---------------------------------------------------------------------------
   # stream  –  redpanda
   # TODO: define when streaming layer is implemented
