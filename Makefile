@@ -253,6 +253,13 @@ lake-counts: ## City event counts for the last 3 hours  (TABLE=demand_events)
 	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm lake counts ${TABLE:-demand_events} --last 3
 
 # ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
+.PHONY: bench
+bench: ## Run Postgres vs ClickHouse benchmark (10 M synthetic rows)
+	$(COMPOSE) $(P_CORE) $(P_ML) $(P_TOOLS) run --rm bench
+
+# ---------------------------------------------------------------------------
 # Batch pipeline (worker)
 # ---------------------------------------------------------------------------
 .PHONY: worker-pipeline
