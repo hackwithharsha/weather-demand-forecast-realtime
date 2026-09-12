@@ -52,7 +52,7 @@ import psycopg2.extras
 import redis
 import structlog
 
-from common.feature_registry import (
+from common.features.registry import (
     BATCH_COMPUTED_AT_FIELD,
     ROUTE_FEATURES,
     ROUTE_REDIS_KEY_PATTERN,

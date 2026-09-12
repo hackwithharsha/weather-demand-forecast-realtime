@@ -37,12 +37,12 @@ import pytest
 
 import app.feature_store as fs_module
 from app.feature_store import _sync_to_redis
-from common.feature_registry import (
+from common.features.registry import (
     BATCH_COMPUTED_AT_FIELD,
     ROUTE_FEATURES,
     ROUTE_REDIS_KEY_PATTERN,
-    FeatureDef,
-    FeatureRegistry,
+    Feature,
+    Registry,
 )
 
 
@@ -109,9 +109,13 @@ class TestFeatureRegistry:
         for feat in ROUTE_FEATURES:
             assert feat.name, "name must not be empty"
             assert feat.dtype, "dtype must not be empty"
-            assert feat.source, "source must not be empty"
-            assert feat.freshness_sla, "freshness_sla must not be empty"
-            assert feat.owner, "owner must not be empty"
+            assert feat.source in ("batch", "stream"), (
+                f"{feat.name}.source={feat.source!r} must be 'batch' or 'stream'"
+            )
+            assert feat.freshness_sla_seconds > 0, (
+                f"{feat.name}.freshness_sla_seconds must be positive"
+            )
+            assert feat.description, "description must not be empty"
 
     def test_names_returns_ordered_list(self):
         names = ROUTE_FEATURES.names()
@@ -121,7 +125,8 @@ class TestFeatureRegistry:
     def test_lookup_by_name_succeeds(self):
         feat = ROUTE_FEATURES["avg_bookings_90d"]
         assert feat.dtype == "float64"
-        assert feat.source == "marts.route_features_daily"
+        assert feat.source == "batch"
+        assert feat.freshness_sla_seconds == 86_400
 
     def test_lookup_missing_name_raises_key_error(self):
         with pytest.raises(KeyError, match="not registered"):
@@ -138,16 +143,19 @@ class TestFeatureRegistry:
         assert not missing, f"DOW seasonality features missing from registry: {missing}"
 
     def test_duplicate_names_raise_at_construction(self):
-        feat = FeatureDef("x", "float64", "t", "PT24H", "team")
+        feat = Feature("x", "float64", "batch", 86_400, "desc")
         with pytest.raises(ValueError, match="Duplicate"):
-            FeatureRegistry([feat, feat])
+            Registry([feat, feat])
 
-    def test_freshness_sla_is_iso8601_duration(self):
-        """All SLAs should be ISO-8601 duration strings starting with 'PT' or 'P'."""
+    def test_freshness_sla_seconds_is_positive(self):
+        """All freshness SLAs must be positive integers (seconds)."""
         for feat in ROUTE_FEATURES:
-            assert feat.freshness_sla.startswith("P"), (
-                f"{feat.name}.freshness_sla={feat.freshness_sla!r} "
-                "is not an ISO-8601 duration (must start with 'P')"
+            assert isinstance(feat.freshness_sla_seconds, int), (
+                f"{feat.name}.freshness_sla_seconds must be int, "
+                f"got {type(feat.freshness_sla_seconds).__name__}"
+            )
+            assert feat.freshness_sla_seconds > 0, (
+                f"{feat.name}.freshness_sla_seconds must be > 0"
             )
 
     def test_redis_key_pattern_contains_route_id_placeholder(self):
