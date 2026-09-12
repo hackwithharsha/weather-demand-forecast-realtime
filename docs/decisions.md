@@ -618,3 +618,86 @@ any `ast.Constant` node matches a registered feature name.
 
 No changes to `feature_store.py` or the API are needed — both iterate
 `ROUTE_FEATURES.names()` dynamically.
+
+---
+
+## Dual-write stream path: Redis (hot) + Parquet lake (cold)
+
+### Context
+
+The stream feature consumers (`services/worker/app/stream_features/consumer.py`)
+must serve two masters simultaneously:
+
+1. **Online serving** — the API reads `feat:route:{route_id}` from Redis with
+   a single `HGETALL`.  Latency budget: < 5 ms p99.  Data must reflect the
+   last event within seconds.
+
+2. **ML training** — models are retrained periodically on historical feature
+   values.  Redis's sliding windows are stateful and not replayable: once an
+   event ages out of the window, it is gone.  Training pipelines need access
+   to what `searches_5m` *was* at any arbitrary past timestamp.
+
+A single-destination write (Redis only) satisfies serving but loses history.
+A Postgres-backed materialised view satisfies history but adds latency to the
+hot path.
+
+### Decision
+
+Each demand event triggers **two writes in the same consumer iteration**:
+
+1. **Redis** (hot): the `update_demand_features()` pipeline round-trip that
+   computes and stores `searches_5m`, `bookings_15m`, `look_to_book_1h`
+   (see §"Sliding-window counters: Redis sorted sets").
+
+2. **ParquetBuffer** (cold): the raw event record (with `event_id`, `city`,
+   `event_type`, `sim_ts`, `quantity`) is appended to an in-memory buffer.
+   Every `stream_parquet_flush_interval_s` seconds (default 60 s), the buffer
+   is serialised to Snappy Parquet and uploaded to
+   `s3://lake/stream/demand_events/dt=YYYY-MM-DD/hour=HH/part_{epoch_ms}.parquet`.
+
+**Partitioning key**: `sim_ts` (business event time), not wall-clock
+ingestion time.  This makes point-in-time window queries fast: to reconstruct
+`searches_5m` at timestamp T, we load at most two hourly partition prefixes
+(`floor(T−5 min)` through `floor(T)`) and filter in DuckDB.
+
+**Idempotency**: At-least-once Kafka delivery may re-deliver events on restart,
+producing duplicate rows in Parquet.  The reconstruction query uses
+`COUNT(DISTINCT event_id)` which mirrors Redis's ZADD idempotency (same
+member → score update, not duplicate insertion).
+
+**Failure semantics**: Redis writes are committed before offset commits; a
+failed Redis write causes the message to be re-delivered.  Parquet uploads
+that fail at flush time return their records to the front of the buffer for
+retry; no silent data loss occurs in either path.
+
+### Reconstruction
+
+`tools/reconstruct.py` replays the exact sliding-window arithmetic from
+`redis_ops.py` against the Parquet lake:
+
+```
+searches_5m  = COUNT(DISTINCT event_id)
+                 WHERE city=R AND event_type='search'
+                   AND sim_epoch ∈ [T−300, T]
+
+bookings_15m = COUNT(DISTINCT event_id)
+                 WHERE city=R AND event_type='booking'
+                   AND sim_epoch ∈ [T−900, T]
+
+look_to_book_1h = bookings_1h / max(1, searches_1h)
+                   where *_1h counts span [T−3600, T]
+```
+
+Because `stream/demand_events/` is partitioned by `sim_ts`, a 1-hour
+window requires scanning at most two hourly prefixes.  DuckDB's httpfs
+extension reads directly from MinIO without staging data locally.
+
+**Verified**: `make reconstruct ROUTE=london` runs `--verify-latest` which:
+1. Fetches the current `feat:route:london` hash from Redis.
+2. Finds the latest sim_ts in the Parquet lake for london.
+3. Reconstructs all three features at that timestamp.
+4. Compares Parquet values to Redis values field-by-field.
+
+All three fields (`searches_5m`, `bookings_15m`, `look_to_book_1h`) match
+across both storage paths for every tested route (london, tokyo, new_york,
+sydney, dubai).

@@ -272,6 +272,19 @@ bench-redis: ## Benchmark Redis sliding-window writes; find p99 > 5 ms threshold
 		--host localhost --port 6379 \
 		--password $${REDIS_PASSWORD:-changeme}
 
+.PHONY: reconstruct
+reconstruct: ## Reconstruct stream features from Parquet lake  (ROUTE=london AT=2031-..., or ROUTE=london --verify-latest)
+	MINIO_ENDPOINT_URL=http://localhost:9000 \
+	MINIO_ACCESS_KEY=$${MINIO_SVC_ACCESS_KEY:-svc-lake} \
+	MINIO_SECRET_KEY=$${MINIO_SVC_SECRET_KEY:-changeme-svc-lake} \
+	LAKE_BUCKET=lake \
+	REDIS_HOST=localhost \
+	REDIS_PORT=6379 \
+	REDIS_PASSWORD=$${REDIS_PASSWORD:-changeme} \
+	python3 tools/reconstruct.py \
+		--route $${ROUTE:?usage: make reconstruct ROUTE=<city>} \
+		$$(if [ -n "$${AT:-}" ]; then echo "--at $${AT}"; else echo "--verify-latest"; fi)
+
 # ---------------------------------------------------------------------------
 # Batch pipeline (worker)
 # ---------------------------------------------------------------------------
