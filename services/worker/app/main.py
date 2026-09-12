@@ -4,8 +4,8 @@ Worker: APScheduler-driven batch pipeline.
 Schedule
 --------
 The pipeline fires at HH:05 UTC on every wall-clock hour.  The 5-minute
-offset gives the ingestor's ParquetWriter time to flush the previous hour's
-Parquet file before this job tries to read it.
+offset ensures the ingestor has had time to write the tail of the previous
+hour's events into raw.* before staging reads them.
 
 Startup behaviour
 -----------------

@@ -3,12 +3,14 @@ Batch pipeline orchestrator: raw → staging → marts → scaler (once).
 
 Steps
 -----
-1. staging   Read from the Parquet lake (MinIO) via DuckDB, aggregate by
-             business hour, and upsert into staging.demand_hourly and
-             staging.weather_hourly.
+1. staging   Execute versioned SQL files in sql/staging/ against raw.* Postgres
+             tables.  Each file deduplicates, validates, rejects bad rows to
+             staging.rejects, and aggregates clean rows into staging.demand_hourly
+             / staging.weather_hourly (one Postgres round-trip per file).
 
-2. marts     Read from staging, compute lag, rolling, cyclical, weather,
-             and holiday features, then upsert into marts.city_hour_features.
+2. marts     Execute sql/marts/001_city_hour_features.sql (window functions,
+             cyclical encoding, weather join), then Python-fills is_holiday via
+             a bulk UPDATE, then asserts row counts and null rates.
 
 3. scaler    On the very first run (no artifact in S3), fit a StandardScaler
              on the mart table and save it to MinIO.  Every subsequent run

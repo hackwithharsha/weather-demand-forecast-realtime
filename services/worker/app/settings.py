@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     # How far back (in days) the staging populate and initial scaler fit look.
     training_lookback_days: int = 30
     # Minute of the hour at which the cron job fires (default: 5 past the hour,
-    # giving the ParquetWriter time to flush the previous hour's file first).
+    # allowing the ingestor's tail events for the previous hour to land in
+    # raw.* before staging reads them).
     pipeline_cron_minute:   int = 5
 
     # S3 key inside lake_bucket where the fitted scaler is stored.

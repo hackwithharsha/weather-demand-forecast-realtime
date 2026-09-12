@@ -21,6 +21,7 @@ RUN mkdir -p app && touch app/__init__.py \
 
 # Layer 3 — source
 COPY services/worker/app/ ./app/
+COPY services/worker/sql/ ./sql/
 
 USER app
 
