@@ -89,6 +89,10 @@ build-%: ## Build a specific service image  (e.g. make build-api)
 # ---------------------------------------------------------------------------
 # Shells
 # ---------------------------------------------------------------------------
+.PHONY: shell
+shell: ## Open sh in a running container  (SERVICE=name, e.g. make shell SERVICE=api)
+	$(COMPOSE) exec $${SERVICE:?usage: make shell SERVICE=<name>} sh
+
 .PHONY: shell-db
 shell-db: ## Open psql inside the postgres container
 	$(COMPOSE) exec postgres psql -U $${POSTGRES_USER:-forecast} $${POSTGRES_DB:-forecast}
@@ -96,6 +100,47 @@ shell-db: ## Open psql inside the postgres container
 .PHONY: shell-redis
 shell-redis: ## Open redis-cli inside the redis container
 	$(COMPOSE) exec redis redis-cli -a $${REDIS_PASSWORD}
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+.PHONY: test
+test: ## Run tests for all services that have them
+	@echo "No services with tests yet."
+
+.PHONY: test-%
+test-%: ## Run tests for a single service  (e.g. make test-api)
+	$(COMPOSE) run --rm $* pytest -v
+
+# ---------------------------------------------------------------------------
+# Verify
+# ---------------------------------------------------------------------------
+.PHONY: verify
+verify: ## Assert postgres and redis are healthy (exit 1 if not)
+	@ok=1; \
+	for svc in postgres redis; do \
+		printf "  %-10s " "$$svc"; \
+		id=$$($(COMPOSE) $(P_CORE) ps -q $$svc 2>/dev/null); \
+		if [ -z "$$id" ]; then \
+			echo "NOT RUNNING"; ok=0; \
+		else \
+			status=$$(docker inspect --format='{{.State.Health.Status}}' $$id 2>/dev/null); \
+			if [ "$$status" = "healthy" ]; then \
+				echo "OK  (healthy)"; \
+			else \
+				echo "FAIL  ($$status)"; ok=0; \
+			fi; \
+		fi; \
+	done; \
+	[ $$ok -eq 1 ] || exit 1
+
+# ---------------------------------------------------------------------------
+# Reset
+# ---------------------------------------------------------------------------
+.PHONY: reset
+reset: ## Wipe all volumes and restart core services from scratch
+	$(COMPOSE) $(P_ALL) down -v --remove-orphans
+	$(COMPOSE) $(P_CORE) up -d
 
 # ---------------------------------------------------------------------------
 # Utilities
