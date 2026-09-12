@@ -123,23 +123,74 @@ test-%: ## Run tests for a compose service  (e.g. make test-api)
 # Verify
 # ---------------------------------------------------------------------------
 .PHONY: verify
-verify: ## Assert postgres and redis are healthy (exit 1 if not)
+verify: ## Assert infra healthy; validate mock-weather schema and chaos toggle
 	@ok=1; \
+	W=http://localhost:8001; \
+	_pass() { printf "  %-42s OK  %s\n"   "$$1" "$$2"; }; \
+	_fail() { printf "  %-42s FAIL  %s\n" "$$1" "$$2"; ok=0; }; \
+	\
+	printf "\n--- infrastructure ---\n"; \
 	for svc in postgres redis; do \
-		printf "  %-10s " "$$svc"; \
+		printf "  %-42s " "$$svc"; \
 		id=$$($(COMPOSE) $(P_CORE) ps -q $$svc 2>/dev/null); \
 		if [ -z "$$id" ]; then \
-			echo "NOT RUNNING"; ok=0; \
+			echo "FAIL  (not running)"; ok=0; \
 		else \
-			status=$$(docker inspect --format='{{.State.Health.Status}}' $$id 2>/dev/null); \
-			if [ "$$status" = "healthy" ]; then \
-				echo "OK  (healthy)"; \
-			else \
-				echo "FAIL  ($$status)"; ok=0; \
-			fi; \
+			st=$$(docker inspect --format='{{.State.Health.Status}}' "$$id" 2>/dev/null); \
+			[ "$$st" = "healthy" ] && echo "OK" || { echo "FAIL  ($$st)"; ok=0; }; \
 		fi; \
 	done; \
-	[ $$ok -eq 1 ] || exit 1
+	\
+	printf "\n--- mock-weather ---\n"; \
+	mw_id=$$($(COMPOSE) $(P_CORE) ps -q mock-weather 2>/dev/null); \
+	if [ -z "$$mw_id" ]; then \
+		echo "  mock-weather not running — skipping endpoint checks"; \
+	else \
+		printf "  %-42s " "health"; \
+		mw_st=$$(docker inspect --format='{{.State.Health.Status}}' "$$mw_id" 2>/dev/null); \
+		if [ "$$mw_st" != "healthy" ]; then \
+			echo "FAIL  ($$mw_st)"; ok=0; \
+		else \
+			echo "OK"; \
+			\
+			printf "  %-42s " "GET /v1/current schema"; \
+			body=$$(curl -sf "$$W/v1/current?lat=51.5&lon=-0.1" 2>/dev/null); \
+			echo "$$body" | python3 -c 'import sys,json; cc=json.load(sys.stdin)["currentConditions"]; assert {"temperature","feelsLike","humidity","wind","precipitation","weatherCondition","uvIndex","cloudCover"}.issubset(cc)' 2>/dev/null \
+			&& echo "OK" || { echo "FAIL  (unexpected body)"; ok=0; }; \
+			\
+			printf "  %-42s " "GET /v1/forecast schema (3 h)"; \
+			body=$$(curl -sf "$$W/v1/forecast?lat=51.5&lon=-0.1&hours=3" 2>/dev/null); \
+			echo "$$body" | python3 -c 'import sys,json; fh=json.load(sys.stdin)["forecastHours"]; assert len(fh)==3 and "interval" in fh[0] and "temperature" in fh[0]' 2>/dev/null \
+			&& echo "OK  (3 h)" || { echo "FAIL  (unexpected body)"; ok=0; }; \
+			\
+			printf "  %-42s " "POST /admin/chaos error_rate=1.0"; \
+			curl -sf -X POST "$$W/admin/chaos" \
+				-H 'Content-Type: application/json' \
+				-d '{"error_rate":1.0}' >/dev/null 2>&1 \
+			&& echo "OK" || { echo "FAIL  (request failed)"; ok=0; }; \
+			\
+			printf "  %-42s " "GET /v1/current → expect 5xx"; \
+			code=$$(curl -s -o /dev/null -w '%{http_code}' "$$W/v1/current?lat=51.5&lon=-0.1"); \
+			case "$$code" in \
+				5*) echo "OK  (HTTP $$code)" ;; \
+				*)  echo "FAIL  (expected 5xx, got $$code)"; ok=0 ;; \
+			esac; \
+			\
+			printf "  %-42s " "POST /admin/chaos error_rate=0.0 (reset)"; \
+			curl -sf -X POST "$$W/admin/chaos" \
+				-H 'Content-Type: application/json' \
+				-d '{"error_rate":0.0}' >/dev/null 2>&1 \
+			&& echo "OK" || { echo "FAIL  (request failed)"; ok=0; }; \
+			\
+			printf "  %-42s " "GET /v1/current → expect 200"; \
+			code=$$(curl -s -o /dev/null -w '%{http_code}' "$$W/v1/current?lat=51.5&lon=-0.1"); \
+			[ "$$code" = "200" ] \
+				&& echo "OK  (HTTP 200)" \
+				|| { echo "FAIL  (expected 200, got $$code)"; ok=0; }; \
+		fi; \
+	fi; \
+	printf "\n"; \
+	[ "$$ok" = "1" ] || exit 1
 
 # ---------------------------------------------------------------------------
 # Reset
