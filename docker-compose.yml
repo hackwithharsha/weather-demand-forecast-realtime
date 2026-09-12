@@ -42,6 +42,27 @@ services:
       retries: 5
       start_period: 5s
 
+  mock-weather:
+    build:
+      context: services/mock-weather
+      dockerfile: Dockerfile
+    profiles: [core]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      FAULT_LATENCY_MS:      ${FAULT_LATENCY_MS:-0}
+      FAULT_ERROR_RATE:      ${FAULT_ERROR_RATE:-0}
+      FAULT_NULL_FIELD_RATE: ${FAULT_NULL_FIELD_RATE:-0}
+      FAULT_SCHEMA_DRIFT:    ${FAULT_SCHEMA_DRIFT:-false}
+    ports:
+      - "127.0.0.1:8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   # ---------------------------------------------------------------------------
   # stream  –  redpanda
   # TODO: define when streaming layer is implemented
