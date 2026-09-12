@@ -1,7 +1,7 @@
 services:
 
   # ---------------------------------------------------------------------------
-  # core  –  postgres + redis
+  # core  –  postgres + redis + mock-weather
   # ---------------------------------------------------------------------------
 
   postgres:
@@ -63,27 +63,127 @@ services:
       retries: 3
       start_period: 15s
 
+  # ---------------------------------------------------------------------------
+  # stream  –  redpanda + console + producers + ingestor
+  # ---------------------------------------------------------------------------
+
+  redpanda:
+    image: redpandadata/redpanda:v24.3.1
+    profiles: [stream]
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --kafka-addr      internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr        redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode            dev-container
+      - --smp             1
+      - --default-log-level=warn
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    ports:
+      - "127.0.0.1:19092:19092"   # Kafka API (external)
+      - "127.0.0.1:18082:18082"   # HTTP Proxy
+      - "127.0.0.1:18081:18081"   # Schema Registry
+      - "127.0.0.1:9644:9644"     # Admin API
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 6
+      start_period: 30s
+
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    profiles: [stream]
+    restart: unless-stopped
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  redpanda-init:
+    image: redpandadata/redpanda:v24.3.1
+    profiles: [stream]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        rpk topic create demand.events.v1    --partitions 3 --brokers redpanda:9092 || true
+        rpk topic create weather.readings.v1 --partitions 3 --brokers redpanda:9092 || true
+        rpk topic create demand.events.dlq   --partitions 3 --brokers redpanda:9092 || true
+        echo "topics ready"
+
   event-generator:
     build:
       context: .
       dockerfile: services/event-generator/Dockerfile
-    profiles: [core]
+    profiles: [stream]
     restart: unless-stopped
     env_file: .env
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
     environment:
-      CITIES:          ${GENERATOR_CITIES:-london,new_york,tokyo,sydney,dubai}
-      TICK_INTERVAL_S: ${GENERATOR_TICK_INTERVAL_S:-1.0}
-      SIM_SPEED:       ${GENERATOR_SIM_SPEED:-3600.0}
-      SIM_START:       ${GENERATOR_SIM_START:-}
+      CITIES:                   ${GENERATOR_CITIES:-london,new_york,tokyo,sydney,dubai}
+      TICK_INTERVAL_S:          ${GENERATOR_TICK_INTERVAL_S:-1.0}
+      SIM_SPEED:                ${GENERATOR_SIM_SPEED:-3600.0}
+      SIM_START:                ${GENERATOR_SIM_START:-}
+      KAFKA_BOOTSTRAP_SERVERS:  redpanda:9092
+      DEMAND_TOPIC:             demand.events.v1
 
-  # ---------------------------------------------------------------------------
-  # stream  –  redpanda
-  # TODO: define when streaming layer is implemented
-  # ---------------------------------------------------------------------------
+  weather-poller:
+    build:
+      context: .
+      dockerfile: services/weather-poller/Dockerfile
+    profiles: [stream]
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      mock-weather:
+        condition: service_healthy
+    environment:
+      CITIES:                   ${GENERATOR_CITIES:-london,new_york,tokyo,sydney,dubai}
+      POLL_INTERVAL_S:          ${POLLER_POLL_INTERVAL_S:-30.0}
+      MOCK_WEATHER_URL:         http://mock-weather:8001
+      KAFKA_BOOTSTRAP_SERVERS:  redpanda:9092
+      WEATHER_TOPIC:            weather.readings.v1
 
-  # redpanda:
-  #   image: redpandadata/redpanda:latest
-  #   profiles: [stream]
+  ingestor:
+    build:
+      context: .
+      dockerfile: services/ingestor/Dockerfile
+    profiles: [stream]
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST:            postgres
+      POSTGRES_PORT:            5432
+      POSTGRES_DB:              ${POSTGRES_DB:-forecast}
+      POSTGRES_USER:            ${POSTGRES_USER:-forecast}
+      POSTGRES_PASSWORD:        ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      KAFKA_BOOTSTRAP_SERVERS:  redpanda:9092
+      DEMAND_TOPIC:             demand.events.v1
+      WEATHER_TOPIC:            weather.readings.v1
+      DLQ_TOPIC:                demand.events.dlq
 
   # ---------------------------------------------------------------------------
   # ml  –  clickhouse, minio, mlflow
@@ -139,3 +239,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  redpanda_data:

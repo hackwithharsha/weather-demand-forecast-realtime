@@ -26,8 +26,8 @@ up: ## Start core services (postgres, redis)
 	$(COMPOSE) $(P_CORE) up -d
 
 .PHONY: up-stream
-up-stream: ## Start streaming services (redpanda)
-	$(COMPOSE) $(P_STREAM) up -d
+up-stream: ## Start core + streaming services (redpanda, producers, ingestor)
+	$(COMPOSE) $(P_CORE) $(P_STREAM) up -d
 
 .PHONY: up-ml
 up-ml: ## Start ML services (clickhouse, minio, mlflow)

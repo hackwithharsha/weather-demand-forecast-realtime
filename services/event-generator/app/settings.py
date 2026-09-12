@@ -37,6 +37,16 @@ class Settings(BaseSettings):
         description="ISO-8601 datetime for simulation start, e.g. 2024-01-01T00:00:00Z",
     )
 
+    kafka_bootstrap_servers: str = Field(
+        default="redpanda:9092",
+        description="Comma-separated Kafka bootstrap servers",
+    )
+
+    demand_topic: str = Field(
+        default="demand.events.v1",
+        description="Topic to produce demand events to",
+    )
+
     @field_validator("sim_start", mode="before")
     @classmethod
     def _coerce_none(cls, v: object) -> str:
