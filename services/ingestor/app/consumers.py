@@ -3,11 +3,12 @@ Consumer threads — one per topic.
 
 Each thread:
   1. Polls its topic in a tight loop.
-  2. Parses the JSON value.
-  3. Writes to the corresponding Postgres raw table.
-  4. Commits the Kafka offset only after a successful DB write.
-  5. On DB failure: produces the raw message to the DLQ then commits the
-     offset (so the poison message doesn't stall the partition).
+  2. Parses the JSON envelope (schema_version, event_id, produced_at, payload).
+  3. Validates the schema_version is one it knows how to handle.
+  4. Writes the payload to the corresponding Postgres raw table.
+  5. Commits the Kafka offset only after a successful DB write.
+  6. On any processing failure: sends the raw bytes to the DLQ with a
+     reason header, then commits the offset (no stuck partitions).
 
 Threading model
 ---------------
@@ -29,10 +30,16 @@ import psycopg2
 import structlog
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 
+from common.producer import EventProducer
+
 from .db import connect, insert_demand_event, insert_weather_reading
 from .settings import Settings
 
 log = structlog.get_logger()
+
+# Schema versions this ingestor knows how to handle
+_KNOWN_DEMAND_VERSIONS  = frozenset({EventProducer.DEMAND_EVENTS_SCHEMA_VERSION})
+_KNOWN_WEATHER_VERSIONS = frozenset({EventProducer.WEATHER_READINGS_SCHEMA_VERSION})
 
 
 def _make_consumer(settings: Settings, group_id: str) -> Consumer:
@@ -70,6 +77,21 @@ def _send_to_dlq(
         log.error("dlq_produce_failed", error=str(exc))
 
 
+def _unwrap(raw_value: bytes) -> tuple[int, str, dict[str, Any]]:
+    """
+    Decode and unwrap a message envelope.
+
+    Returns (schema_version, event_id, payload).
+    Raises KeyError if required envelope fields are missing.
+    """
+    envelope: dict[str, Any] = json.loads(raw_value)
+    return (
+        envelope["schema_version"],
+        envelope["event_id"],
+        envelope["payload"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Demand consumer
 # ---------------------------------------------------------------------------
@@ -99,16 +121,28 @@ def demand_consumer_loop(
 
             raw_value = msg.value()
             try:
-                data: dict[str, Any] = json.loads(raw_value)
-                insert_demand_event(conn, data, msg.partition(), msg.offset())
+                schema_version, event_id, payload = _unwrap(raw_value)
+
+                if schema_version not in _KNOWN_DEMAND_VERSIONS:
+                    raise ValueError(
+                        f"unknown demand schema_version={schema_version}"
+                    )
+
+                insert_demand_event(
+                    conn, payload, msg.partition(), msg.offset(),
+                    schema_version=schema_version, event_id=event_id,
+                )
                 log.debug(
                     "demand_inserted",
-                    city=data.get("city"),
-                    event_type=data.get("event_type"),
+                    city=payload.get("city"),
+                    event_type=payload.get("event_type"),
+                    schema_version=schema_version,
+                    event_id=event_id,
                     offset=msg.offset(),
                     partition=msg.partition(),
                 )
-            except (json.JSONDecodeError, KeyError, psycopg2.Error) as exc:
+
+            except (json.JSONDecodeError, KeyError, ValueError, psycopg2.Error) as exc:
                 if isinstance(exc, psycopg2.Error):
                     try:
                         conn.rollback()
@@ -165,15 +199,27 @@ def weather_consumer_loop(
 
             raw_value = msg.value()
             try:
-                data: dict[str, Any] = json.loads(raw_value)
-                insert_weather_reading(conn, data, msg.partition(), msg.offset())
+                schema_version, event_id, payload = _unwrap(raw_value)
+
+                if schema_version not in _KNOWN_WEATHER_VERSIONS:
+                    raise ValueError(
+                        f"unknown weather schema_version={schema_version}"
+                    )
+
+                insert_weather_reading(
+                    conn, payload, msg.partition(), msg.offset(),
+                    schema_version=schema_version, event_id=event_id,
+                )
                 log.debug(
                     "weather_inserted",
-                    city=data.get("city"),
+                    city=payload.get("city"),
+                    schema_version=schema_version,
+                    event_id=event_id,
                     offset=msg.offset(),
                     partition=msg.partition(),
                 )
-            except (json.JSONDecodeError, KeyError, psycopg2.Error) as exc:
+
+            except (json.JSONDecodeError, KeyError, ValueError, psycopg2.Error) as exc:
                 if isinstance(exc, psycopg2.Error):
                     try:
                         conn.rollback()

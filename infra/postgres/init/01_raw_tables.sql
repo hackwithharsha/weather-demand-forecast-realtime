@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS raw.demand_events (
     condition        TEXT,
     kafka_partition  SMALLINT,
     kafka_offset     BIGINT,
+    schema_version   SMALLINT,
+    event_id         TEXT,
     received_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
@@ -44,6 +46,8 @@ CREATE TABLE IF NOT EXISTS raw.weather_readings (
     condition              TEXT,
     kafka_partition        SMALLINT,
     kafka_offset           BIGINT,
+    schema_version         SMALLINT,
+    event_id               TEXT,
     received_at            TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 

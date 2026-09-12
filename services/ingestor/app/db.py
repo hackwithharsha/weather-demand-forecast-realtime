@@ -1,8 +1,8 @@
 """
 Synchronous Postgres helpers for the ingestor (psycopg2).
 
-Each consumer thread owns one connection; these functions operate on that
-connection and do not manage transactions — callers must commit/rollback.
+Each consumer thread owns one connection.  These functions operate on that
+connection without managing transactions — callers must commit/rollback.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import Any
 
 import psycopg2
-import psycopg2.extras
 import structlog
 
 log = structlog.get_logger()
@@ -27,25 +26,31 @@ def insert_demand_event(
     data: dict[str, Any],
     partition: int,
     offset: int,
+    *,
+    schema_version: int,
+    event_id: str,
 ) -> None:
     sql = """
         INSERT INTO raw.demand_events
             (city, event_type, sim_ts, quantity, temperature_c, condition,
-             kafka_partition, kafka_offset)
+             kafka_partition, kafka_offset, schema_version, event_id)
         VALUES
             (%(city)s, %(event_type)s, %(sim_ts)s, %(quantity)s,
-             %(temperature_c)s, %(condition)s, %(partition)s, %(offset)s)
+             %(temperature_c)s, %(condition)s,
+             %(partition)s, %(offset)s, %(schema_version)s, %(event_id)s)
     """
     with conn.cursor() as cur:
         cur.execute(sql, {
-            "city":          data["city"],
-            "event_type":    data["event_type"],
-            "sim_ts":        data["sim_ts"],
-            "quantity":      data["quantity"],
-            "temperature_c": data.get("temperature_c"),
-            "condition":     data.get("condition"),
-            "partition":     partition,
-            "offset":        offset,
+            "city":           data["city"],
+            "event_type":     data["event_type"],
+            "sim_ts":         data["sim_ts"],
+            "quantity":       data["quantity"],
+            "temperature_c":  data.get("temperature_c"),
+            "condition":      data.get("condition"),
+            "partition":      partition,
+            "offset":         offset,
+            "schema_version": schema_version,
+            "event_id":       event_id,
         })
     conn.commit()
 
@@ -55,20 +60,27 @@ def insert_weather_reading(
     data: dict[str, Any],
     partition: int,
     offset: int,
+    *,
+    schema_version: int,
+    event_id: str,
 ) -> None:
     sql = """
         INSERT INTO raw.weather_readings
             (city, polled_at, temperature_c, feels_like_c, dew_point_c,
              humidity_pct, wind_kph, wind_direction_deg, cloud_cover_pct,
              precip_probability_pct, precip_mm, condition,
-             kafka_partition, kafka_offset)
+             kafka_partition, kafka_offset, schema_version, event_id)
         VALUES
             (%(city)s, %(polled_at)s, %(temperature_c)s, %(feels_like_c)s,
              %(dew_point_c)s, %(humidity_pct)s, %(wind_kph)s,
              %(wind_direction_deg)s, %(cloud_cover_pct)s,
              %(precip_probability_pct)s, %(precip_mm)s, %(condition)s,
-             %(partition)s, %(offset)s)
+             %(partition)s, %(offset)s, %(schema_version)s, %(event_id)s)
     """
     with conn.cursor() as cur:
-        cur.execute(sql, {**data, "partition": partition, "offset": offset})
+        cur.execute(sql, {**data,
+                          "partition":      partition,
+                          "offset":         offset,
+                          "schema_version": schema_version,
+                          "event_id":       event_id})
     conn.commit()
