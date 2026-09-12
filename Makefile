@@ -27,7 +27,7 @@ up: ## Start core services (postgres, redis)
 	$(COMPOSE) $(P_CORE) up -d
 
 .PHONY: up-stream
-up-stream: ## Start core + streaming services (redpanda, producers, ingestor)
+up-stream: ## Start core + streaming services (redpanda, producers, ingestor, worker)
 	$(COMPOSE) $(P_CORE) $(P_STREAM) up -d
 
 .PHONY: up-ml
@@ -251,6 +251,13 @@ lake: ## Run lake CLI (e.g. make lake CMD="list")
 .PHONY: lake-counts
 lake-counts: ## City event counts for the last 3 hours  (TABLE=demand_events)
 	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm lake counts ${TABLE:-demand_events} --last 3
+
+# ---------------------------------------------------------------------------
+# Batch pipeline (worker)
+# ---------------------------------------------------------------------------
+.PHONY: worker-pipeline
+worker-pipeline: ## Run the batch pipeline once now (raw → staging → marts → scaler)
+	$(COMPOSE) $(P_CORE) $(P_STREAM) run --rm worker python -m app.pipeline
 
 # ---------------------------------------------------------------------------
 # Utilities
