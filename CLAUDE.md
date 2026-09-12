@@ -1,132 +1,110 @@
 # Weather-Driven Demand Forecasting Platform
 
-## Overview
+Ingests weather signals and historical demand data, trains sklearn-based
+forecasting models, and serves predictions via a FastAPI backend with a React
+frontend. The full pipeline runs on Redpanda (streaming), Postgres + ClickHouse
+(storage), MinIO (artifacts), and MLflow (experiment tracking).
 
-End-to-end platform that ingests weather signals and historical demand data,
-trains sklearn-based forecasting models, and serves predictions via a FastAPI
-backend with a React frontend.
-
-Everything runs in Docker Compose. **Nothing is installed on the host except
-Docker and Docker Compose.**
+**Current stage: 0**
 
 ---
 
-## Prerequisites
+## Hard Rule
 
-| Tool | Minimum version |
-|---|---|
-| Docker | 25.x |
-| Docker Compose | v2.24 |
-| GNU Make | 3.81 |
+Everything runs in Docker Compose. No application code, test runner, or tool
+is executed directly on the host. The only host dependencies are Docker 25+,
+Docker Compose v2.24+, and GNU Make 3.81+.
+
+---
+
+## Services
+
+| Service | Image / Source | Port | Profile |
+|---|---|---|---|
+| postgres | postgres:16-alpine | 5432 | core |
+| redis | redis:7-alpine | 6379 | core |
+| redpanda | redpandadata/redpanda | 9092 / 9644 | streaming |
+| clickhouse | clickhouse/clickhouse-server | 8123 / 9000 | storage |
+| minio | minio/minio | 9001 / 9002 | storage |
+| mlflow | infra/mlflow | 5000 | ml |
+| prometheus | prom/prometheus | 9090 | observability |
+| grafana | grafana/grafana | 3001 | observability |
+| api | services/api | 8000 | app |
+| ingestion | services/ingestion | — | app |
+| forecaster | services/forecaster | 8001 | app |
+| frontend | services/frontend | 5173 | app |
 
 ---
 
 ## Quick Start
 
 ```bash
-cp .env.example .env          # fill in secrets
-make up                       # starts core profile (postgres, redis)
-make ps                       # verify containers are healthy
+make env        # copies .env.example → .env
+# edit .env: set POSTGRES_PASSWORD and REDIS_PASSWORD
+make up         # starts core profile (postgres, redis)
+make ps         # verify healthy
 ```
 
 ---
 
-## Docker Compose Profiles
+## Make Targets
 
-Services are grouped by profile. Start only what you need.
+```
+make up              start core profile (postgres, redis)
+make up-streaming    start redpanda
+make up-storage      start minio, clickhouse
+make up-ml           start mlflow
+make up-obs          start prometheus, grafana
+make up-app          start api, ingestion, forecaster, frontend
+make up-all          start everything
+make down            stop containers, keep volumes
+make destroy         stop containers, delete volumes
+make ps              container status
+make logs            tail all logs
+make logs-<svc>      tail one service  (e.g. make logs-api)
+make shell-db        psql inside postgres
+make shell-redis     redis-cli inside redis
+make test-<svc>      run tests for a service (see below)
+```
 
-| Profile | Services | Make target |
-|---|---|---|
-| `core` | postgres, redis | `make up` |
-| `streaming` | redpanda | `make up-streaming` |
-| `storage` | minio, clickhouse | `make up-storage` |
-| `ml` | mlflow | `make up-ml` |
-| `observability` | prometheus, grafana | `make up-obs` |
-| `app` | api, ingestion, forecaster, frontend | `make up-app` |
+---
 
-To start everything:
+## Running Tests
+
+Tests run inside the service container. No test runner on the host.
 
 ```bash
-make up-all
+make test-api          # docker compose run --rm api pytest
+make test-ingestion    # docker compose run --rm ingestion pytest
+make test-forecaster   # docker compose run --rm forecaster pytest
 ```
+
+Each service's `Dockerfile` must have a stage or target that includes dev
+dependencies (pytest, etc.). The `make test-<svc>` targets will be wired up
+as services are implemented.
 
 ---
 
-## Repository Layout
+## Python Conventions
 
-```
-.
-├── CLAUDE.md               # this file
-├── Makefile                # all dev workflows
-├── docker-compose.yml      # all service definitions
-├── .env.example            # required env vars with safe defaults
-│
-├── services/               # code you own
-│   ├── api/                # FastAPI application
-│   │   ├── Dockerfile
-│   │   └── app/            # Python package root
-│   ├── ingestion/          # weather + demand data ingest workers
-│   │   └── Dockerfile
-│   ├── forecaster/         # sklearn training + inference service
-│   │   └── Dockerfile
-│   └── frontend/           # React application
-│       └── Dockerfile
-│
-├── infra/                  # third-party service configuration
-│   ├── postgres/init/      # *.sql files run at first boot
-│   ├── clickhouse/init/    # *.sql files run at first boot
-│   ├── redpanda/config/    # redpanda.yaml overrides
-│   ├── minio/buckets.sh    # idempotent bucket creation
-│   ├── mlflow/Dockerfile   # thin wrapper over mlflow image
-│   ├── prometheus/         # prometheus.yml scrape config
-│   └── grafana/            # provisioned datasources + dashboards
-│
-└── scripts/                # one-off shell helpers (seed, topic creation, etc.)
-```
+| Topic | Rule |
+|---|---|
+| Dependency management | `uv` — never pip directly |
+| Linting / formatting | `ruff` (check + format); enforced in CI |
+| Data models / validation | Pydantic v2 (`model_config`, no v1 compat shims) |
+| Structured logging | `structlog` with JSON renderer; no `print()` in production paths |
+| Exception handling | No bare `except:`; always catch a specific exception type |
+| Python version | 3.12-slim base image |
 
 ---
 
-## Environment Variables
+## Health Endpoints
 
-All secrets and config live in `.env` (git-ignored). See `.env.example` for
-the full list with descriptions.
-
-Never commit `.env`.
-
----
-
-## Common Make Targets
+Every owned service (`api`, `ingestion`, `forecaster`) must expose:
 
 ```
-make help          list all targets with descriptions
-make up            start core services
-make up-all        start every profile
-make down          stop and remove containers (keeps volumes)
-make destroy       stop and remove containers AND volumes
-make logs          tail all running service logs
-make ps            show container status
-make shell-db      open psql inside the postgres container
-make shell-redis   open redis-cli inside the redis container
+GET /health  →  200 {"status": "ok"}
 ```
 
----
-
-## Adding a New Service
-
-1. Add the service definition to `docker-compose.yml` under the appropriate profile.
-2. If it needs config files, create `infra/<service>/` and mount it.
-3. If it is a service you own, add `services/<service>/Dockerfile`.
-4. Add a `make up-<profile>` target if a new profile is introduced.
-5. Document the service in the table above.
-
----
-
-## Conventions
-
-- Python services target **Python 3.12-slim**.
-- Frontend targets **Node 22-alpine**.
-- All inter-service communication uses the Docker Compose service name as hostname.
-- Secrets are never hardcoded; always read from environment variables.
-- Healthchecks are required on every stateful service.
-- Volumes are named (not bind-mounted) for stateful data.
-- Bind mounts are used only for config files and source code hot-reload in dev.
+This endpoint is used by Docker Compose `healthcheck` and by any future
+orchestrator. It must not require authentication.
