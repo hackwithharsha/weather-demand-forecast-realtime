@@ -173,16 +173,21 @@ class TestFeatureRegistry:
         assert key == "feat:route:london"
 
     def test_registry_names_match_sync_query_fields(self):
-        """_LATEST_ROUTE_FEATURES_SQL must SELECT every feature in the registry.
+        """_LATEST_ROUTE_FEATURES_SQL must SELECT every *batch* feature.
 
-        This test catches the case where the registry gains a new feature but
-        the SQL query in feature_store.py is not updated to include it.
+        Stream features have no column in marts.route_features_daily so they
+        must NOT appear in the SQL.  This test catches both cases.
         """
         sql = fs_module._LATEST_ROUTE_FEATURES_SQL
-        for name in ROUTE_FEATURES.names():
-            assert name in sql, (
-                f"Feature '{name}' is in ROUTE_FEATURES but not in "
+        for feat in ROUTE_FEATURES.by_source("batch"):
+            assert feat.name in sql, (
+                f"Batch feature '{feat.name}' is in ROUTE_FEATURES but not in "
                 "_LATEST_ROUTE_FEATURES_SQL.  Add it to the SELECT list."
+            )
+        for feat in ROUTE_FEATURES.by_source("stream"):
+            assert feat.name not in sql, (
+                f"Stream feature '{feat.name}' must NOT be in "
+                "_LATEST_ROUTE_FEATURES_SQL — it has no mart column."
             )
 
 
@@ -273,18 +278,32 @@ class TestSyncToRedis:
 
     # -- Field names come from registry, not literals -------------------------
 
-    def test_all_registry_features_present_in_mapping(self):
+    def test_all_batch_registry_features_present_in_mapping(self):
+        """Every batch feature must appear in the Redis hash written by sync.
+
+        Stream features are intentionally absent — they are written by the
+        real-time consumer, not the nightly batch job.
+        """
         pipe = self._run_sync([_make_row("london")])
         _, mapping = pipe.calls[0]
-        for feat in ROUTE_FEATURES:
+        for feat in ROUTE_FEATURES.by_source("batch"):
             assert feat.name in mapping, (
-                f"Field '{feat.name}' missing from Redis mapping"
+                f"Batch field '{feat.name}' missing from Redis mapping"
             )
 
-    def test_no_extra_fields_beyond_registry_plus_timestamp(self):
+    def test_no_stream_features_in_batch_mapping(self):
+        """Stream features must NOT be written by the batch sync job."""
         pipe = self._run_sync([_make_row("london")])
         _, mapping = pipe.calls[0]
-        allowed = set(ROUTE_FEATURES.names()) | {BATCH_COMPUTED_AT_FIELD}
+        for feat in ROUTE_FEATURES.by_source("stream"):
+            assert feat.name not in mapping, (
+                f"Stream field '{feat.name}' must not appear in batch sync mapping"
+            )
+
+    def test_no_extra_fields_beyond_batch_registry_plus_timestamp(self):
+        pipe = self._run_sync([_make_row("london")])
+        _, mapping = pipe.calls[0]
+        allowed = {f.name for f in ROUTE_FEATURES.by_source("batch")} | {BATCH_COMPUTED_AT_FIELD}
         extra = set(mapping.keys()) - allowed
         assert not extra, f"Unexpected fields in Redis mapping: {extra}"
 

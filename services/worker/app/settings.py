@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     # Increment the version suffix to force a re-fit on the next run.
     features_pipeline_s3_key: str = "artifacts/pipelines/features_v1.pkl"
 
+    # Kafka (stream feature consumers)
+    kafka_bootstrap_servers: str = "redpanda:9092"
+    demand_topic:            str = "demand.events.v1"
+    weather_topic:           str = "weather.readings.v1"
+
+    stream_demand_group_id:          str = "worker-stream-demand"
+    stream_weather_group_id:         str = "worker-stream-weather"
+    stream_parquet_flush_interval_s: int = 60
+
     # Redis (offline feature store)
     redis_host:     str = "redis"
     redis_port:     int = 6379

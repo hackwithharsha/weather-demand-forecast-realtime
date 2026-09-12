@@ -1,5 +1,6 @@
 """
-Worker: APScheduler-driven batch pipeline and feature store sync.
+Worker: APScheduler-driven batch pipeline, feature store sync, and stream
+feature consumers.
 
 Schedule
 --------
@@ -14,6 +15,15 @@ Nightly sync     02:30 UTC  — route mart computation + Redis feature store syn
                                Hour and minute are configurable via
                                FEATURE_STORE_CRON_HOUR / FEATURE_STORE_CRON_MINUTE.
 
+Stream consumers (always-on background threads)
+-----------------------------------------------
+demand_stream_consumer_loop   Reads demand.events.v1, updates Redis sliding-
+                               window aggregates (searches_5m, bookings_15m,
+                               look_to_book_1h) and writes events to the lake.
+
+weather_stream_consumer_loop  Reads weather.readings.v1, writes latest weather
+                               values to Redis and events to the lake.
+
 Startup behaviour
 -----------------
 The hourly pipeline is also executed once immediately on startup so there is no
@@ -21,12 +31,19 @@ silent gap between deployment and the first scheduled run.  APScheduler's
 ``coalesce=True`` then collapses any additional missed runs into one catch-up
 execution.  The feature store sync is NOT run at startup to avoid hammering
 Redis and Postgres during a rolling deploy.
+
+Shutdown
+--------
+SIGTERM / SIGINT sets *stop_event*, which signals the stream consumer threads
+to drain their Parquet buffers and exit cleanly.  The scheduler is told to stop
+(without waiting for running jobs), causing ``scheduler.start()`` to return.
+``main()`` then joins the consumer threads before exiting.
 """
 
 from __future__ import annotations
 
 import signal
-import sys
+import threading
 
 import structlog
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -37,6 +54,7 @@ from common.log import configure_logging
 from .feature_store import run_feature_store
 from .pipeline import run_pipeline
 from .settings import Settings
+from .stream_features import demand_stream_consumer_loop, weather_stream_consumer_loop
 
 log = structlog.get_logger()
 
@@ -45,9 +63,30 @@ def main() -> None:
     settings = Settings()
     configure_logging(settings.log_level)
 
+    # Shared stop signal for the stream consumer threads.
+    stop_event = threading.Event()
+
+    # ── Stream feature consumers ──────────────────────────────────────────
+    # Started before the scheduler so they begin consuming immediately.
+    # daemon=False ensures the process waits for a clean drain on exit.
+    demand_thread = threading.Thread(
+        target=demand_stream_consumer_loop,
+        args=[settings, stop_event],
+        name="stream-demand",
+        daemon=False,
+    )
+    weather_thread = threading.Thread(
+        target=weather_stream_consumer_loop,
+        args=[settings, stop_event],
+        name="stream-weather",
+        daemon=False,
+    )
+    demand_thread.start()
+    weather_thread.start()
+
+    # ── APScheduler ───────────────────────────────────────────────────────
     scheduler = BlockingScheduler(timezone="UTC")
 
-    # ── Hourly batch pipeline ─────────────────────────────────────────────
     scheduler.add_job(
         run_pipeline,
         CronTrigger(minute=settings.pipeline_cron_minute, timezone="UTC"),
@@ -58,7 +97,6 @@ def main() -> None:
         coalesce=True,
     )
 
-    # ── Nightly feature store sync ────────────────────────────────────────
     scheduler.add_job(
         run_feature_store,
         CronTrigger(
@@ -69,15 +107,16 @@ def main() -> None:
         args=[settings],
         id="feature_store_sync",
         name="route mart → Redis feature store",
-        # Allow up to 10 minutes late start (Redis + Postgres warm-up).
         misfire_grace_time=600,
         coalesce=True,
     )
 
     def _shutdown(signum: int, frame: object) -> None:
         log.info("worker_shutdown_signal", signal=signum)
+        # Signal consumers to drain and exit.
+        stop_event.set()
+        # Stop the scheduler (non-blocking; running jobs continue to completion).
         scheduler.shutdown(wait=False)
-        sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -95,7 +134,13 @@ def main() -> None:
     except Exception:
         log.warning("worker_startup_pipeline_failed_continuing")
 
+    # Blocks until _shutdown() calls scheduler.shutdown().
     scheduler.start()
+
+    # Wait for stream consumer threads to drain their Parquet buffers.
+    demand_thread.join()
+    weather_thread.join()
+    log.info("worker_stopped")
 
 
 if __name__ == "__main__":

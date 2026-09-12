@@ -210,13 +210,19 @@ class TestRouteFeatures:
     def test_batch_computed_at_field_constant(self):
         assert BATCH_COMPUTED_AT_FIELD == "batch_computed_at"
 
-    def test_all_route_features_are_batch(self):
-        """All current route features are offline/batch; none are stream."""
-        stream_feats = ROUTE_FEATURES.by_source("stream")
-        assert not stream_feats, (
-            f"Unexpected stream features in ROUTE_FEATURES: "
-            f"{[f.name for f in stream_feats]}"
-        )
+    def test_stream_features_present(self):
+        """Registry must contain at least the six expected stream features."""
+        expected = {
+            "searches_5m", "bookings_15m", "look_to_book_1h",
+            "weather_temp_c", "weather_precip_mm", "weather_condition",
+        }
+        registered_stream = {f.name for f in ROUTE_FEATURES.by_source("stream")}
+        missing = expected - registered_stream
+        assert not missing, f"Missing stream features in ROUTE_FEATURES: {missing}"
+
+    def test_stream_features_have_correct_source(self):
+        for feat in ROUTE_FEATURES.by_source("stream"):
+            assert feat.source == "stream"
 
 
 # ---------------------------------------------------------------------------

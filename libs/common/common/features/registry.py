@@ -48,6 +48,9 @@ __all__ = [
     "ROUTE_REDIS_KEY_PATTERN",
     "BATCH_COMPUTED_AT_FIELD",
     "SYNC_COMPLETED_AT_KEY",
+    "STREAM_COMPUTED_AT_FIELD",
+    "STREAM_SEARCHES_KEY_PATTERN",
+    "STREAM_BOOKINGS_KEY_PATTERN",
 ]
 
 Source = Literal["batch", "stream"]
@@ -153,6 +156,23 @@ BATCH_COMPUTED_AT_FIELD: str = "batch_computed_at"
 #: See docs/decisions.md §"Partial-failure handling for the nightly Redis sync".
 SYNC_COMPLETED_AT_KEY: str = "feat:sync:completed_at"
 
+# ---------------------------------------------------------------------------
+# Stream feature Redis key patterns
+# ---------------------------------------------------------------------------
+
+#: Hash field written by the stream consumer alongside stream feature values.
+#: Records when the most recent stream event for this route was processed.
+STREAM_COMPUTED_AT_FIELD: str = "stream_computed_at"
+
+#: Sorted set key for search events.  score = sim_ts epoch (float seconds).
+#: member = event_id (deduplicates at-least-once Kafka delivery).
+#: Trimmed to 1 hour (the longest sliding window) on every write.
+#: See docs/decisions.md §"Sliding-window counters".
+STREAM_SEARCHES_KEY_PATTERN: str = "feat:stream:{route_id}:searches"
+
+#: Sorted set key for booking events.  Same score/member semantics as above.
+STREAM_BOOKINGS_KEY_PATTERN: str = "feat:stream:{route_id}:bookings"
+
 # Day-of-week order: 1=Mon … 7=Sun (ISO 8601 / PostgreSQL EXTRACT(ISODOW)).
 _DOW_ABBRS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
@@ -233,6 +253,84 @@ ROUTE_FEATURES: Registry = Registry([
             "all available history as of feature_date.  Positive = demand "
             "rises with temperature (summer-peak routes); negative = inverse "
             "(cold-weather routes).  Null when temperature data is missing."
+        ),
+    ),
+
+    # ── Stream features (online, written by the demand/weather consumers) ──
+    # These occupy disjoint HSET fields in the same feat:route:{id} hash.
+    # The sliding-window state is maintained in separate sorted sets;
+    # only the computed aggregate values land in the hash.
+    # See docs/decisions.md §"Sliding-window counters".
+
+    Feature(
+        name="searches_5m",
+        dtype="float64",
+        source="stream",
+        freshness_sla_seconds=300,  # 5 minutes
+        description=(
+            "Count of demand events with event_type='search' in the "
+            "5-minute sliding window ending at the last event's sim_ts.  "
+            "Updated on every demand event for this route."
+        ),
+        default_on_missing=0.0,
+    ),
+    Feature(
+        name="bookings_15m",
+        dtype="float64",
+        source="stream",
+        freshness_sla_seconds=900,  # 15 minutes
+        description=(
+            "Count of demand events with event_type='booking' in the "
+            "15-minute sliding window ending at the last event's sim_ts.  "
+            "Updated on every demand event for this route."
+        ),
+        default_on_missing=0.0,
+    ),
+    Feature(
+        name="look_to_book_1h",
+        dtype="float64",
+        source="stream",
+        freshness_sla_seconds=3_600,  # 1 hour
+        description=(
+            "Ratio of bookings to searches over the 1-hour sliding window: "
+            "bookings_1h / max(1, searches_1h).  Range [0, ∞); values > 1 "
+            "indicate more bookings than searches (unusual — may signal a "
+            "data quality issue).  Updated on every demand event."
+        ),
+        default_on_missing=0.0,
+    ),
+    Feature(
+        name="weather_temp_c",
+        dtype="float64",
+        source="stream",
+        freshness_sla_seconds=3_600,  # weather polling interval
+        description=(
+            "Latest temperature in Celsius for this route, taken from "
+            "the most recent weather.readings.v1 message.  Null when no "
+            "weather reading has been received yet."
+        ),
+    ),
+    Feature(
+        name="weather_precip_mm",
+        dtype="float64",
+        source="stream",
+        freshness_sla_seconds=3_600,
+        description=(
+            "Latest precipitation in millimetres for this route, taken "
+            "from the most recent weather.readings.v1 message.  Null when "
+            "no weather reading has been received yet."
+        ),
+        default_on_missing=0.0,
+    ),
+    Feature(
+        name="weather_condition",
+        dtype="str",
+        source="stream",
+        freshness_sla_seconds=3_600,
+        description=(
+            "Latest weather condition string (e.g. 'Clear', 'Rain') for "
+            "this route.  Stored as-is from the weather.readings.v1 payload.  "
+            "Null when no weather reading has been received yet."
         ),
     ),
 ])

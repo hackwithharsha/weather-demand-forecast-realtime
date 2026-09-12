@@ -291,6 +291,113 @@ pipeline is flushed in one network round-trip after all routes are queued).
 
 ---
 
+## Sliding-window counters: Redis sorted sets vs counter-per-minute buckets
+
+### Context
+
+The stream-features consumer computes three sliding-window metrics per route
+from `demand.events.v1`:
+
+| Metric | Window |
+|---|---|
+| `searches_5m` | 5 minutes of search events |
+| `bookings_15m` | 15 minutes of booking events |
+| `look_to_book_1h` | bookings ÷ searches over 1 hour |
+
+Both must be recomputed on every incoming event and written to
+`feat:route:{route_id}` as HSET fields.  The implementation choice is
+between two Redis data structures.
+
+### Option A — counter-per-minute buckets
+
+Maintain one `INCR` key per (route, event_type, minute):
+
+```
+INCR feat:stream:{route_id}:searches:min:202401170234   # expires in 2h
+```
+
+To answer "searches in the last 5 minutes": issue 5 separate `GET` commands
+and sum them.  For `look_to_book_1h`: 60 GETs for bookings + 60 GETs for
+searches = 120 round-trips (or one MGET of 120 keys).
+
+**Why this was rejected.**
+
+- **Clock alignment.** Minute-bucket boundaries are wall-clock minutes, not
+  event-time minutes.  A burst of events arriving at 14:59:59 and 15:00:01
+  ends up in different buckets even though they are 2 seconds apart.  The
+  window query must either accept this ±1 minute error or manage partial-
+  bucket arithmetic.
+
+- **Query overhead scales with window width.** `look_to_book_1h` requires
+  reading 120 keys per event (60 search buckets + 60 booking buckets).  Any
+  future addition of a wider window (e.g. `searches_24h`) would multiply that.
+
+- **TTL management is subtle.** Each bucket key needs an independent TTL long
+  enough to cover the longest window.  Setting TTLs incorrectly silently
+  loses data.  Forgetting to set TTL leaks keys indefinitely.
+
+### Option B — Redis sorted sets (chosen)
+
+Maintain one sorted set per (route, event_type):
+
+```
+feat:stream:{route_id}:searches   ZSET — score = sim_ts epoch, member = event_id
+feat:stream:{route_id}:bookings   ZSET — score = sim_ts epoch, member = event_id
+```
+
+On every demand event, run a single pipelined round-trip:
+
+```
+ZADD   feat:stream:{city}:searches   {epoch}  {event_id}   # if event_type=='search'
+ZREMRANGEBYSCORE ...searches 0 (epoch-3601)  # trim to 1h
+ZREMRANGEBYSCORE ...bookings 0 (epoch-3601)  # trim to 1h
+ZCOUNT ...searches  (epoch-300)  epoch        # → searches_5m
+ZCOUNT ...bookings  (epoch-900)  epoch        # → bookings_15m
+ZCOUNT ...searches  (epoch-3600) epoch        # → searches_1h
+ZCOUNT ...bookings  (epoch-3600) epoch        # → bookings_1h
+```
+
+`results[-4:]` from `pipe.execute()` yield the four counts regardless of
+whether a ZADD was issued.  `look_to_book_1h = bookings_1h / max(1, searches_1h)`.
+
+### Why sorted sets win
+
+| Property | Counter buckets | Sorted sets |
+|---|---|---|
+| Window queries per event | 5 + 15 + 120 reads | 1 pipeline round-trip |
+| Window accuracy | ±1 minute bucket | Exact (sim_ts to the second) |
+| Clock alignment issues | Yes | No |
+| New window width | N more GETs | One more ZCOUNT in same pipeline |
+| Deduplication (at-least-once) | Count inflates on re-delivery | ZADD with same member is idempotent |
+| Memory per route | Negligible (counters) | O(events/hour) — ~50 KB at 1 000 events/h |
+| Trim mechanism | Per-key TTL | `ZREMRANGEBYSCORE` on same pipeline |
+
+The only cost of sorted sets is memory: each member stores an event_id string
+(~36 bytes for a UUID-4) plus the 8-byte score.  At a generous 1 000 events/
+hour on a busy route with 100 routes, that is roughly 100 routes × 2 sets ×
+1 000 members × ~50 bytes = **10 MB** — negligible against a typical Redis
+instance.
+
+**`sim_ts` as the score, not `now()`.**  Using the event's business timestamp
+as the sorted-set score means the window is point-in-time correct even when
+replaying backfill events.  Using wall-clock `now()` would assign future scores
+to late-arriving events and silently inflate windows during replay.
+
+**ZADD `event_id` as member = at-least-once idempotency.**  Confluent Kafka
+with `enable.auto.commit=False` and per-message commits delivers at-least once.
+ZADD with the same `(score, member)` pair is a no-op, so re-delivered events
+do not inflate counts.
+
+### Interaction with the batch job
+
+The sorted sets use a separate key namespace (`feat:stream:{route_id}:…`)
+from the route feature hashes (`feat:route:{route_id}`).  The stream consumer
+only calls `HSET feat:route:{route_id}` with the *computed* aggregate values
+(not raw event storage).  The batch job's HSET writes disjoint fields
+(`avg_bookings_90d`, etc.) and never touches the sorted set keys.
+
+---
+
 ## Partial-failure handling for the nightly Redis sync
 
 ### Context

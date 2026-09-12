@@ -252,6 +252,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
     environment:
       POSTGRES_HOST:                postgres
       POSTGRES_PORT:                5432
@@ -270,6 +272,10 @@ services:
       REDIS_PASSWORD:               ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       FEATURE_STORE_CRON_HOUR:      ${FEATURE_STORE_CRON_HOUR:-2}
       FEATURE_STORE_CRON_MINUTE:    ${FEATURE_STORE_CRON_MINUTE:-30}
+      KAFKA_BOOTSTRAP_SERVERS:      redpanda:9092
+      DEMAND_TOPIC:                 demand.events.v1
+      WEATHER_TOPIC:                weather.readings.v1
+      STREAM_PARQUET_FLUSH_INTERVAL_S: ${STREAM_PARQUET_FLUSH_INTERVAL_S:-60}
 
   # ---------------------------------------------------------------------------
   # tools  –  alembic migrations + lake CLI

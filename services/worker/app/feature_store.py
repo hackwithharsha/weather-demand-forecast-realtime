@@ -85,7 +85,12 @@ _LATEST_ROUTE_FEATURES_SQL = """
         feature_computed_at
     FROM marts.route_features_daily
     ORDER BY route_id, feature_date DESC
-""".format(fields=", ".join(ROUTE_FEATURES.names()))
+""".format(
+    # Only batch-sourced features exist in marts.route_features_daily.
+    # Stream features are written by the real-time consumer and must NOT
+    # appear in this SQL — they have no column in the mart table.
+    fields=", ".join(f.name for f in ROUTE_FEATURES.by_source("batch"))
+)
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +217,10 @@ def _sync_to_redis(
 
                 # Build the field mapping from the registry — no feature-name
                 # strings here.  Null values are excluded; see docstring above.
+                # Only batch features are in the mart table; stream features
+                # are managed by the real-time consumer (stream_features/).
                 mapping: dict[str, str] = {}
-                for feat in ROUTE_FEATURES:
+                for feat in ROUTE_FEATURES.by_source("batch"):
                     value = row.get(feat.name)
                     if value is not None:
                         mapping[feat.name] = str(float(value))
