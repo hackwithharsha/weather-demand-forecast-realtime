@@ -266,6 +266,12 @@ lake-counts: ## City event counts for the last 3 hours  (TABLE=demand_events)
 bench: ## Run Postgres vs ClickHouse benchmark (10 M synthetic rows)
 	$(COMPOSE) $(P_CORE) $(P_ML) $(P_TOOLS) run --rm bench
 
+.PHONY: bench-redis
+bench-redis: ## Benchmark Redis sliding-window writes; find p99 > 5 ms threshold
+	python3 tools/bench_sliding_window.py \
+		--host localhost --port 6379 \
+		--password $${REDIS_PASSWORD:-changeme}
+
 # ---------------------------------------------------------------------------
 # Batch pipeline (worker)
 # ---------------------------------------------------------------------------
