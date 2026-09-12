@@ -15,6 +15,7 @@ dependencies = [
     "psycopg2-binary>=2.9",
     "pyarrow>=14.0",
     "pydantic-settings>=2.5",
+    "redis>=5.0",
     "scikit-learn>=1.4",
     "structlog>=24.4",
 ]

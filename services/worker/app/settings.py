@@ -38,6 +38,18 @@ class Settings(BaseSettings):
     # Increment the version suffix to force a re-fit on the next run.
     features_pipeline_s3_key: str = "artifacts/pipelines/features_v1.pkl"
 
+    # Redis (offline feature store)
+    redis_host:     str = "redis"
+    redis_port:     int = 6379
+    redis_db:       int = 0
+    redis_password: str = Field(..., description="Required — set REDIS_PASSWORD")
+
+    # Feature store sync schedule.
+    # Defaults to 02:30 UTC — after the 02:05 mart run completes but well
+    # before peak serving load starts.
+    feature_store_cron_hour:   int = 2
+    feature_store_cron_minute: int = 30
+
     @property
     def postgres_dsn(self) -> str:
         return (

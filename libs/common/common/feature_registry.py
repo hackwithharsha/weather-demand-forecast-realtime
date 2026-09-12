@@ -1,0 +1,221 @@
+"""
+Feature registry: single source of truth for every feature definition.
+
+Both the batch sync job (services/worker) and the serving API (services/api)
+import from this module.  No service writes feature-name strings as literals.
+
+Adding a new feature
+--------------------
+1. Add a ``FeatureDef`` entry to the relevant registry constant below.
+2. Add the corresponding column to the Postgres mart table (Alembic migration).
+3. Add the column to the SQL file that populates the mart table.
+
+The batch sync job reads ``registry.names()`` to build the Redis HSET mapping.
+The API reads the same list to know which hash fields to fetch and how to cast
+the stored strings back to typed values.  Neither service owns a hard-coded
+list of feature names.
+
+Field conventions
+-----------------
+``name``           Snake-case Python identifier.  Used verbatim as the
+                   Redis hash field name AND the Postgres column name, so
+                   changing a name requires a coordinated migration + deploy.
+``dtype``          NumPy / Arrow canonical dtype string.  Governs how the
+                   API casts the Redis string value back to a Python type.
+``source``         Fully-qualified Postgres table that is the authoritative
+                   source.  The batch job reads from here; the API does NOT.
+``freshness_sla``  Maximum acceptable staleness at serving time expressed as
+                   an ISO-8601 duration string (e.g. ``"PT24H"`` = 24 hours).
+                   The API should emit an alert if ``batch_computed_at`` is
+                   older than this.
+``owner``          Team or on-call rotation responsible for data quality.
+``description``    Human-readable purpose; surfaced in documentation and
+                   monitoring dashboards.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+__all__ = [
+    "FeatureDef",
+    "FeatureRegistry",
+    "ROUTE_FEATURES",
+    "ROUTE_REDIS_KEY_PATTERN",
+    "BATCH_COMPUTED_AT_FIELD",
+]
+
+DType = Literal["float64", "float32", "int64", "int32", "bool", "str"]
+
+
+@dataclass(frozen=True)
+class FeatureDef:
+    """Immutable metadata descriptor for a single feature."""
+
+    name: str
+    dtype: DType
+    source: str
+    freshness_sla: str
+    owner: str
+    description: str = ""
+
+
+class FeatureRegistry:
+    """Ordered, name-indexed collection of :class:`FeatureDef` objects.
+
+    Examples
+    --------
+    >>> reg = FeatureRegistry([FeatureDef("x", "float64", "marts.t", "PT24H", "team")])
+    >>> reg["x"].dtype
+    'float64'
+    >>> reg.names()
+    ['x']
+    >>> list(reg)
+    [FeatureDef(name='x', ...)]
+    """
+
+    def __init__(self, features: list[FeatureDef]) -> None:
+        self._features = list(features)
+        self._by_name: dict[str, FeatureDef] = {f.name: f for f in self._features}
+        if len(self._by_name) != len(self._features):
+            seen: set[str] = set()
+            dupes = [f.name for f in self._features if f.name in seen or seen.add(f.name)]  # type: ignore[func-returns-value]
+            raise ValueError(f"Duplicate feature names in registry: {dupes}")
+
+    # ------------------------------------------------------------------
+    # Mapping-like access
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, name: str) -> FeatureDef:
+        try:
+            return self._by_name[name]
+        except KeyError:
+            raise KeyError(
+                f"Feature {name!r} is not registered.  "
+                f"Known features: {self.names()}"
+            ) from None
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._by_name
+
+    def __iter__(self):
+        return iter(self._features)
+
+    def __len__(self) -> int:
+        return len(self._features)
+
+    # ------------------------------------------------------------------
+    # Bulk accessors used by the batch job and API
+    # ------------------------------------------------------------------
+
+    def names(self) -> list[str]:
+        """Ordered list of feature names; mirrors the mart column order.
+
+        The batch job iterates this list to build the Redis HSET mapping.
+        The API iterates this list to build the HMGET field list.
+        """
+        return [f.name for f in self._features]
+
+    def by_dtype(self, dtype: DType) -> list[FeatureDef]:
+        """Return all features whose ``dtype`` matches *dtype*."""
+        return [f for f in self._features if f.dtype == dtype]
+
+
+# ---------------------------------------------------------------------------
+# Route feature registry
+# ---------------------------------------------------------------------------
+
+#: Redis key template for route features.
+#: Format: ``ROUTE_REDIS_KEY_PATTERN.format(route_id="london")``
+ROUTE_REDIS_KEY_PATTERN: str = "feat:route:{route_id}"
+
+#: Hash field written alongside feature values that records when the batch ran.
+#: Used by the API to enforce ``freshness_sla`` and emit staleness alerts.
+BATCH_COMPUTED_AT_FIELD: str = "batch_computed_at"
+
+# Day-of-week order: 1=Mon … 7=Sun (ISO 8601 / PostgreSQL EXTRACT(ISODOW)).
+_DOW_ABBRS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+ROUTE_FEATURES: FeatureRegistry = FeatureRegistry([
+    FeatureDef(
+        name="avg_bookings_90d",
+        dtype="float64",
+        source="marts.route_features_daily",
+        freshness_sla="PT24H",
+        owner="demand-team",
+        description=(
+            "Rolling 90-day average of daily bookings for the route, "
+            "computed over the 90 calendar days that precede feature_date. "
+            "Null when fewer than one full day of history exists."
+        ),
+    ),
+    # Seven seasonality columns — one per ISO day-of-week.
+    # seasonality_{dow} = (avg demand on that DOW) / (route overall avg demand).
+    # > 1 means above-average demand on that day; < 1 means below-average.
+    *[
+        FeatureDef(
+            name=f"seasonality_{dow}",
+            dtype="float64",
+            source="marts.route_features_daily",
+            freshness_sla="PT24H",
+            owner="demand-team",
+            description=(
+                f"Seasonality index for {dow.capitalize()}s: ratio of the "
+                f"route's average {dow.capitalize()} demand to its overall "
+                "daily average across all history. "
+                "Null when fewer than one occurrence of this weekday is recorded."
+            ),
+        )
+        for dow in _DOW_ABBRS
+    ],
+    FeatureDef(
+        name="lead_time_p50",
+        dtype="float64",
+        source="marts.route_features_daily",
+        freshness_sla="PT24H",
+        owner="demand-team",
+        description=(
+            "Median booking lead time in hours (P50 of ingested_at − sim_ts) "
+            "over the 90 days preceding feature_date. "
+            "Positive values indicate advance-booking patterns."
+        ),
+    ),
+    FeatureDef(
+        name="lead_time_p90",
+        dtype="float64",
+        source="marts.route_features_daily",
+        freshness_sla="PT24H",
+        owner="demand-team",
+        description=(
+            "90th-percentile booking lead time in hours over the 90 days "
+            "preceding feature_date. High P90 signals a long-tail of "
+            "far-in-advance purchases that can inflate demand forecasts."
+        ),
+    ),
+    FeatureDef(
+        name="cancellation_rate_180d",
+        dtype="float64",
+        source="marts.route_features_daily",
+        freshness_sla="PT24H",
+        owner="demand-team",
+        description=(
+            "Fraction of demand events with event_type='cancellation' over "
+            "the 180 days preceding feature_date.  Range [0, 1]; 0.0 when "
+            "no cancellation events are recorded."
+        ),
+    ),
+    FeatureDef(
+        name="elasticity_estimate",
+        dtype="float64",
+        source="marts.route_features_daily",
+        freshness_sla="PT24H",
+        owner="demand-team",
+        description=(
+            "Pearson correlation between temperature_c and total_demand over "
+            "all available history as of feature_date.  Positive = demand "
+            "rises with temperature (summer-peak routes); negative = inverse "
+            "(cold-weather routes).  Null when temperature data is missing."
+        ),
+    ),
+])

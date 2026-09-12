@@ -227,3 +227,121 @@ make bench
 | Analytical scans | Slow at 10 M+ rows | Fast by design |
 | Operational queries | Row-level access, joins | Expensive cross-row lookups |
 | Sync lag | Real-time (source) | ~5 min batch sync (acceptable for training) |
+
+---
+
+## HSET vs SET for the feature store
+
+### Context
+
+The nightly batch sync reads `marts.route_features_daily` and writes one
+feature vector per route into Redis.  The two obvious Redis data structures
+are a plain string key (`SET feat:route:london <json>`) and a hash
+(`HSET feat:route:london field1 v1 field2 v2 …`).
+
+### Decision
+
+Use **`HSET` with individual field-level writes**.  The sync calls
+`pipe.hset(key, mapping={feat: value, …})` for each route inside a pipeline.
+The `SET` command is explicitly forbidden in `feature_store.py` and
+documented with an inline comment explaining why.
+
+### Rationale
+
+**Concurrent writers can safely update disjoint fields.**
+
+Today only the nightly batch writes to `feat:route:{id}`.  In the near term
+an online pipeline will compute `lead_time_p50` / `lead_time_p90` from the
+live booking stream and update those two fields every 5 minutes.  With `SET`,
+each writer holds the full JSON blob; a write-after-write from the online
+pipeline overwrites the offline `avg_bookings_90d` computed by the batch, or
+vice versa.  With `HSET`, the online pipeline calls
+`HSET feat:route:london lead_time_p50 1.8 lead_time_p90 6.2` and touches
+only those two fields; all other fields remain untouched.
+
+**The API reads individual fields cheaply.**
+
+`HGET feat:route:london avg_bookings_90d` fetches one field in O(1) without
+parsing JSON.  `HMGET feat:route:london f1 f2 …` fetches a subset.  Both
+are impossible with a string key without deserialising the whole blob.
+
+**TTL semantics are per-key, not per-field — and that is correct.**
+
+A single key-level TTL covers the entire feature vector.  If the batch job
+fails, the whole key expires together rather than leaving a partial vector
+where half the fields are fresh and half are stale from two nightly cycles
+ago.  The `batch_computed_at` hash field gives the API a precise staleness
+signal to enforce `freshness_sla` from the registry.
+
+**No atomicity concern for the batch job.**
+
+The batch sync writes every field for a route in a single `HSET` call inside
+a Redis pipeline, so the hash is either fully updated or not at all (the
+pipeline is flushed in one network round-trip after all routes are queued).
+
+### Trade-offs
+
+- Redis hashes have slightly higher per-key overhead than strings (one hash
+  object vs one string).  At the scale of a few hundred routes with ~15
+  fields each this is negligible.
+- Monitoring for "all fields present" requires checking hash length or
+  specific field existence; with JSON you would check the key exists.  The
+  `batch_computed_at` field acts as the canary: its absence signals an
+  incomplete write.
+
+---
+
+## Feature registry: one definition, zero literals
+
+### Context
+
+Features appear in four places: the Postgres mart DDL, the SQL that populates
+it, the batch sync job that writes to Redis, and the API that reads from
+Redis.  Without a shared contract, each service maintains its own list of
+feature-name strings, leading to drift: the API silently reads a field that
+was renamed in the mart, or the batch writes a field the API never reads.
+
+### Decision
+
+All feature metadata lives in a single **`FeatureRegistry`** instance
+(`libs/common/common/feature_registry.py`):
+
+```python
+ROUTE_FEATURES = FeatureRegistry([
+    FeatureDef(name="avg_bookings_90d", dtype="float64",
+               source="marts.route_features_daily", freshness_sla="PT24H",
+               owner="demand-team", ...),
+    ...
+])
+```
+
+The registry is the sole authoritative list of feature names.  Every other
+file that needs a feature name imports the registry and calls
+`ROUTE_FEATURES.names()` or `ROUTE_FEATURES["avg_bookings_90d"]`.  No file
+that is not `feature_registry.py` is permitted to contain a feature-name
+string literal (`"avg_bookings_90d"`, etc.) outside comments.
+
+`tests/test_feature_store.py::TestNoStringLiterals` enforces this by parsing
+`feature_store.py` with Python's `ast` module and failing the test suite if
+any `ast.Constant` node matches a registered feature name.
+
+### What each field in `FeatureDef` is used for
+
+| Field | Used by |
+|---|---|
+| `name` | Postgres column name, Redis hash field name, registry key |
+| `dtype` | API casts the Redis string back to a Python type using this |
+| `source` | Documentation; batch job logs it on mismatch |
+| `freshness_sla` | API compares against `batch_computed_at`; emits alert if stale |
+| `owner` | Paged when a quality assertion fails for this feature |
+| `description` | Surfaced in the feature catalogue and monitoring dashboards |
+
+### Adding a feature
+
+1. Add a `FeatureDef` to `ROUTE_FEATURES` in `feature_registry.py`.
+2. Add the column to the Alembic migration (new revision).
+3. Add the column to `sql/feature_store/001_route_features_daily.sql`.
+4. Run `make migrate`.
+
+No changes to `feature_store.py` or the API are needed — both iterate
+`ROUTE_FEATURES.names()` dynamically.
