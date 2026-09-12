@@ -14,6 +14,9 @@ dependencies = [
     "tenacity>=8.2",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["common"]
 

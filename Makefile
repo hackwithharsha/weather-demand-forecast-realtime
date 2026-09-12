@@ -104,12 +104,19 @@ shell-redis: ## Open redis-cli inside the redis container
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
+.PHONY: test-common
+test-common: ## Run libs/common unit tests (pure Python, no services needed)
+	docker run --rm \
+		-v "$(PWD)/libs/common:/app" \
+		-w /app \
+		python:3.12-slim \
+		sh -c "pip install -q uv && uv pip install --system -q '.[test]' && python -m pytest tests/ -v"
+
 .PHONY: test
-test: ## Run tests for all services that have them
-	@echo "No services with tests yet."
+test: test-common ## Run all tests
 
 .PHONY: test-%
-test-%: ## Run tests for a single service  (e.g. make test-api)
+test-%: ## Run tests for a compose service  (e.g. make test-api)
 	$(COMPOSE) run --rm $* pytest -v
 
 # ---------------------------------------------------------------------------
