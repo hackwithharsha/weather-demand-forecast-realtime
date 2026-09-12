@@ -44,6 +44,7 @@ and the migration — this file does not need editing.
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -64,6 +65,13 @@ from .sql_runner import SqlRunner
 log = structlog.get_logger()
 
 _SQL_DIR = Path(__file__).parent.parent / "sql" / "feature_store"
+
+#: Number of HSET commands queued in one pipeline before flushing to Redis.
+#: 500 keys × ~13 fields × ~50 bytes ≈ 325 KB per round-trip — well inside
+#: Redis's default max-inline-command buffer (64 MB) while keeping round-trip
+#: count low for realistic route counts.  Pass ``batch_size`` explicitly to
+#: _sync_to_redis() to override in tests.
+_PIPELINE_BATCH_SIZE: int = 500
 
 # Query to fetch the most recent feature row per route.
 # DISTINCT ON (route_id) with ORDER BY route_id, feature_date DESC returns
@@ -140,7 +148,11 @@ def _run_route_mart(settings: Settings) -> None:
 # Step 2: sync latest features to Redis
 # ---------------------------------------------------------------------------
 
-def _sync_to_redis(settings: Settings) -> None:
+def _sync_to_redis(
+    settings: Settings,
+    *,
+    batch_size: int = _PIPELINE_BATCH_SIZE,
+) -> None:
     """Read the latest row per route and write it to Redis as a hash.
 
     For each route:
@@ -155,15 +167,16 @@ def _sync_to_redis(settings: Settings) -> None:
     stale "null" strings.  The API must treat a missing hash field as "not yet
     computed" and fall back to a default or emit a feature-freshness alert.
 
-    All HSET calls are issued inside a single pipeline so the entire sync is
-    one network round-trip regardless of the number of routes.
+    HSET calls are batched into pipelines of *batch_size* keys per round-trip.
+    Each pipeline is flushed immediately after filling, bounding both the
+    in-process buffer size and the latency of any single round-trip.
     """
     # ── Fetch from Postgres ───────────────────────────────────────────────
     conn = psycopg2.connect(settings.postgres_dsn)
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(_LATEST_ROUTE_FEATURES_SQL)
-            rows = cur.fetchall()
+            rows: list = cur.fetchall()
     finally:
         conn.close()
 
@@ -175,45 +188,71 @@ def _sync_to_redis(settings: Settings) -> None:
         return
 
     batch_computed_at = datetime.now(timezone.utc).isoformat()
+    t_start = time.monotonic()
 
-    # ── Write to Redis ────────────────────────────────────────────────────
     r = _make_redis_client(settings)
-    pipe = r.pipeline(transaction=False)
 
     routes_synced = 0
     fields_written = 0
+    batches_flushed = 0
 
-    for row in rows:
-        route_id = row["route_id"]
-        key = ROUTE_REDIS_KEY_PATTERN.format(route_id=route_id)
+    # ── Write to Redis in batches ─────────────────────────────────────────
+    for batch_start in range(0, len(rows), batch_size):
+        batch = rows[batch_start : batch_start + batch_size]
+        t_batch = time.monotonic()
 
-        # Build the field mapping from the registry — no feature-name strings
-        # here.  Null values are excluded; see docstring above.
-        mapping: dict[str, str] = {}
-        for feat in ROUTE_FEATURES:
-            value = row.get(feat.name)
-            if value is not None:
-                mapping[feat.name] = str(float(value))
+        pipe = r.pipeline(transaction=False)
+        batch_fields = 0
 
-        # Always write the freshness timestamp even if all features are null.
-        mapping[BATCH_COMPUTED_AT_FIELD] = batch_computed_at
+        for row in batch:
+            route_id = row["route_id"]
+            key = ROUTE_REDIS_KEY_PATTERN.format(route_id=route_id)
 
-        # HSET writes individual fields atomically.
-        # It does NOT replace the entire key — other fields (e.g. online
-        # features written by a separate pipeline) remain untouched.
-        # See docs/decisions.md §"HSET vs SET for the feature store".
-        pipe.hset(key, mapping=mapping)
+            # Build the field mapping from the registry — no feature-name
+            # strings here.  Null values are excluded; see docstring above.
+            mapping: dict[str, str] = {}
+            for feat in ROUTE_FEATURES:
+                value = row.get(feat.name)
+                if value is not None:
+                    mapping[feat.name] = str(float(value))
 
-        routes_synced += 1
-        fields_written += len(mapping)
+            # Always write the freshness timestamp even if all features are null.
+            mapping[BATCH_COMPUTED_AT_FIELD] = batch_computed_at
 
-    pipe.execute()
+            # HSET writes individual fields atomically.
+            # It does NOT replace the entire key — other fields (e.g. online
+            # features written by a separate pipeline) remain untouched.
+            # See docs/decisions.md §"HSET vs SET for the feature store".
+            pipe.hset(key, mapping=mapping)
+            batch_fields += len(mapping)
+
+        pipe.execute()
+        batches_flushed += 1
+
+        batch_elapsed = time.monotonic() - t_batch
+        log.debug(
+            "feature_store_batch_flushed",
+            batch_num=batches_flushed,
+            keys=len(batch),
+            fields=batch_fields,
+            elapsed_ms=round(batch_elapsed * 1000),
+            keys_per_s=round(len(batch) / batch_elapsed) if batch_elapsed else None,
+        )
+
+        routes_synced += len(batch)
+        fields_written += batch_fields
+
     r.close()
 
+    elapsed_s = time.monotonic() - t_start
     log.info(
         "feature_store_redis_sync_done",
         routes_synced=routes_synced,
         fields_written=fields_written,
+        batches_flushed=batches_flushed,
+        elapsed_s=round(elapsed_s, 3),
+        keys_per_s=round(routes_synced / elapsed_s) if elapsed_s else None,
+        fields_per_s=round(fields_written / elapsed_s) if elapsed_s else None,
         batch_computed_at=batch_computed_at,
     )
 

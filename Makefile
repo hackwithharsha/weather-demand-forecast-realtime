@@ -102,6 +102,13 @@ shell-db: ## Open psql inside the postgres container
 shell-redis: ## Open redis-cli inside the redis container
 	$(COMPOSE) exec redis redis-cli -a $${REDIS_PASSWORD}
 
+.PHONY: inspect-features
+inspect-features: ## Dump all feat:route:* keys and their hash fields from Redis
+	@$(COMPOSE) $(P_CORE) exec \
+	    -e REDISCLI_AUTH=$${REDIS_PASSWORD} \
+	    redis \
+	    sh -c 'redis-cli --no-auth-warning --scan --pattern "feat:route:*" | sort | while IFS= read -r key; do printf "\n=== %s ===\n" "$$key"; redis-cli --no-auth-warning HGETALL "$$key" | paste - -; done; printf "\n"'
+
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------

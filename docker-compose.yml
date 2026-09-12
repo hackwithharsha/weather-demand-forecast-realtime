@@ -241,6 +241,7 @@ services:
     build:
       context: .
       dockerfile: services/worker/Dockerfile
+      target: dev
     profiles: [stream]
     restart: unless-stopped
     env_file: .env

@@ -34,6 +34,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import structlog.testing
 
 import app.feature_store as fs_module
 from app.feature_store import _sync_to_redis
@@ -86,17 +87,23 @@ def _make_row(route_id: str, **field_overrides) -> dict[str, Any]:
 
 
 class FakePipeline:
-    """Records hset() calls; mimics redis.client.Pipeline."""
+    """Records hset() calls; mimics redis.client.Pipeline.
+
+    execute_count tracks how many times execute() has been called so tests
+    can assert the correct number of round-trips for a given batch_size.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, str]]] = []
         self.executed = False
+        self.execute_count: int = 0
 
     def hset(self, key: str, mapping: dict[str, str]) -> None:
         self.calls.append((key, mapping))
 
     def execute(self) -> list:
         self.executed = True
+        self.execute_count += 1
         return [1] * len(self.calls)
 
 
@@ -188,8 +195,13 @@ class TestSyncToRedis:
         rows: list[dict],
         *,
         settings: MagicMock | None = None,
+        batch_size: int = 500,
     ) -> FakePipeline:
-        """Run _sync_to_redis with mocked dependencies; return the fake pipeline."""
+        """Run _sync_to_redis with mocked dependencies; return the fake pipeline.
+
+        Pass batch_size to exercise the chunking path (e.g. batch_size=2 with
+        5 rows → 3 pipeline.execute() calls).
+        """
         if settings is None:
             settings = _make_settings()
 
@@ -212,7 +224,7 @@ class TestSyncToRedis:
             patch("app.feature_store.psycopg2.connect", return_value=fake_conn),
             patch("app.feature_store._make_redis_client", return_value=fake_redis),
         ):
-            _sync_to_redis(settings)
+            _sync_to_redis(settings, batch_size=batch_size)
 
         return fake_pipe
 
@@ -284,6 +296,43 @@ class TestSyncToRedis:
         pipe = self._run_sync([])
         assert len(pipe.calls) == 0
         assert not pipe.executed
+
+    # -- Pipeline batching ----------------------------------------------------
+
+    def test_batching_splits_rows_into_multiple_pipeline_flushes(self):
+        """5 rows with batch_size=2 → ceil(5/2)=3 execute() calls, 5 hset() calls.
+
+        The same FakePipeline instance is returned by every pipeline() call
+        (MagicMock return_value semantics), so execute_count accumulates the
+        total number of flushes across all batches.
+        """
+        rows = [_make_row(f"city_{i}") for i in range(5)]
+        pipe = self._run_sync(rows, batch_size=2)
+        assert pipe.execute_count == 3, (
+            f"Expected 3 pipeline flushes for 5 rows with batch_size=2, "
+            f"got {pipe.execute_count}"
+        )
+        assert len(pipe.calls) == 5
+
+    def test_throughput_info_log_emitted(self):
+        """feature_store_redis_sync_done is logged at INFO with all throughput fields."""
+        rows = [_make_row("london"), _make_row("tokyo")]
+        with structlog.testing.capture_logs() as cap:
+            self._run_sync(rows)
+
+        events = [e for e in cap if e.get("event") == "feature_store_redis_sync_done"]
+        assert len(events) == 1, (
+            f"Expected exactly 1 feature_store_redis_sync_done log entry, "
+            f"got {len(events)}.  All captured events: {[e['event'] for e in cap]}"
+        )
+        ev = events[0]
+        assert ev["log_level"] == "info"
+        assert ev["routes_synced"] == 2
+        assert ev["batches_flushed"] == 1   # 2 rows fit in one batch at default size
+        assert "elapsed_s" in ev
+        assert "keys_per_s" in ev
+        assert "fields_per_s" in ev
+        assert "batch_computed_at" in ev
 
 
 # ---------------------------------------------------------------------------

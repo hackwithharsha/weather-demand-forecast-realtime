@@ -1,5 +1,5 @@
 # Build context: repo root  (needed to COPY libs/common)
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -22,6 +22,15 @@ RUN mkdir -p app && touch app/__init__.py \
 # Layer 3 — source
 COPY services/worker/app/ ./app/
 COPY services/worker/sql/ ./sql/
+
+# ── dev / test stage ──────────────────────────────────────────────────────
+FROM base AS dev
+
+# Install test extras (pytest, etc.) on top of production deps
+RUN uv pip install --system --no-cache ".[test]"
+
+# Copy tests so they are available inside the container
+COPY services/worker/tests/ ./services/worker/tests/
 
 USER app
 
