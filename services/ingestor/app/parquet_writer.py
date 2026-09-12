@@ -13,12 +13,13 @@ import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-import boto3
 import psycopg2
 import psycopg2.extras
 import pyarrow as pa
 import pyarrow.parquet as pq
 import structlog
+
+from common.s3 import make_s3_client
 
 from .settings import Settings
 
@@ -63,12 +64,7 @@ class ParquetWriter(threading.Thread):
         self._settings = settings
         self._stop_event = stop_event
         self._written: set[tuple[str, str, int]] = set()  # (table, dt_str, hour)
-        self._s3 = boto3.client(
-            "s3",
-            endpoint_url=settings.minio_endpoint_url,
-            aws_access_key_id=settings.minio_access_key,
-            aws_secret_access_key=settings.minio_secret_key,
-        )
+        self._s3 = make_s3_client(settings)
 
     # ------------------------------------------------------------------
     # Thread entry point

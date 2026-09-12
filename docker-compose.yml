@@ -93,8 +93,10 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
-      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      MINIO_ROOT_USER:      ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD:  ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      MINIO_SVC_ACCESS_KEY: ${MINIO_SVC_ACCESS_KEY:?MINIO_SVC_ACCESS_KEY is required}
+      MINIO_SVC_SECRET_KEY: ${MINIO_SVC_SECRET_KEY:?MINIO_SVC_SECRET_KEY is required}
     volumes:
       - ./infra/minio/buckets.sh:/buckets.sh:ro
     entrypoint: ["/bin/sh", "/buckets.sh"]
@@ -230,8 +232,8 @@ services:
       WEATHER_TOPIC:            weather.readings.v1
       DLQ_TOPIC:                demand.events.dlq
       MINIO_ENDPOINT_URL:       http://minio:9000
-      MINIO_ACCESS_KEY:         ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_KEY:         ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      MINIO_ACCESS_KEY:         ${MINIO_SVC_ACCESS_KEY:?MINIO_SVC_ACCESS_KEY is required}
+      MINIO_SECRET_KEY:         ${MINIO_SVC_SECRET_KEY:?MINIO_SVC_SECRET_KEY is required}
       LAKE_BUCKET:              lake
       PARQUET_FLUSH_INTERVAL_S: ${PARQUET_FLUSH_INTERVAL_S:-60}
 
@@ -259,8 +261,8 @@ services:
     env_file: .env
     environment:
       MINIO_ENDPOINT_URL: http://minio:9000
-      MINIO_ACCESS_KEY:   ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_KEY:   ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      MINIO_ACCESS_KEY:   ${MINIO_SVC_ACCESS_KEY:?MINIO_SVC_ACCESS_KEY is required}
+      MINIO_SECRET_KEY:   ${MINIO_SVC_SECRET_KEY:?MINIO_SVC_SECRET_KEY is required}
       LAKE_BUCKET:        lake
     depends_on:
       minio:
