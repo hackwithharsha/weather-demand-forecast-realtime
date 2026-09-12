@@ -1,91 +1,67 @@
 """
 raw → staging
 
-Reads from the Parquet lake (MinIO via DuckDB httpfs), aggregates raw
-demand events and weather readings to one row per (city, business hour),
-and upserts the results into the Postgres staging tables.
+Executes the versioned SQL files in sql/staging/ against the Postgres raw
+tables and commits the results.  All transform logic (deduplication, null
+validation, reject logging, aggregation) lives in the SQL files; this module
+is a thin executor.
 
-Why business time (sim_ts / polled_at), not ingested_at?
----------------------------------------------------------
-The feature table must align to business time so the ML model learns genuine
-temporal patterns (hour-of-day demand peaks, weekday/weekend seasonality,
-etc.).  ``ingested_at`` is the wall-clock write time; it reflects Kafka lag
-and ParquetWriter trigger timing, not business reality.  ``sim_ts`` and
-``polled_at`` are the actual event times and are always preserved in Parquet.
+Data source: raw.demand_events and raw.weather_readings (Postgres)
+-----------------------------------------------------------------
+Staging reads directly from the raw Postgres tables, not from the Parquet
+lake.  This is the correct boundary for a SQL-based staging layer:
+
+  raw.*  ──SQL transform──►  staging.*  ──Python pandas──►  marts.*
+
+The Parquet lake on MinIO is a parallel analytical export written by the
+ingestor.  It is the read path for large-scale ML training queries (DuckDB /
+Spark), not the input to the staging pipeline.  Reading staging from Postgres
+avoids the 1-hour Parquet lag, keeps the staging step independent of MinIO
+availability, and lets us use full Postgres SQL expressiveness (window
+functions, CTEs, ON CONFLICT) without an embedded in-process query engine.
+
+Window parameter: ingested_at, not sim_ts
+-----------------------------------------
+The window filter uses ingested_at (wall-clock) because:
+  - ingested_at is always aligned with real time regardless of SIM_SPEED
+  - It matches the ParquetWriter's partitioning convention
+  - The SQL still groups by sim_ts / polled_at so staging rows carry
+    business-time keys (hour_ts = date_trunc('hour', sim_ts))
 """
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-import duckdb
-import pandas as pd
 import psycopg2
-import psycopg2.extras
 import structlog
 
 from .settings import Settings
+from .sql_runner import SqlRunner
 
 log = structlog.get_logger()
 
+_SQL_DIR = Path(__file__).parent.parent / "sql" / "staging"
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _floor_hour(dt: datetime) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0)
 
 
-def _esc(s: str) -> str:
-    """Escape single quotes for embedding in a DuckDB SQL string literal."""
-    return s.replace("'", "''")
-
-
-def _nan_to_none(val: object) -> object:
-    try:
-        return None if math.isnan(val) else val  # type: ignore[arg-type]
-    except TypeError:
-        return val
-
-
-def _duck_con(settings: Settings) -> duckdb.DuckDBPyConnection:
-    """Open an in-memory DuckDB connection with S3/MinIO credentials loaded."""
-    con = duckdb.connect()
-    con.execute("LOAD httpfs")
-    endpoint = (
-        settings.minio_endpoint_url
-        .removeprefix("http://")
-        .removeprefix("https://")
-    )
-    use_ssl = "true" if settings.minio_endpoint_url.startswith("https://") else "false"
-    con.execute(f"""
-        CREATE SECRET lake_minio (
-            TYPE      s3,
-            KEY_ID    '{_esc(settings.minio_access_key)}',
-            SECRET    '{_esc(settings.minio_secret_key)}',
-            ENDPOINT  '{_esc(endpoint)}',
-            URL_STYLE 'path',
-            USE_SSL   {use_ssl}
-        )
-    """)
-    return con
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def run_staging(settings: Settings) -> None:
     """
-    Populate staging.demand_hourly and staging.weather_hourly for the
-    configured ``training_lookback_days`` window and upsert into Postgres.
+    Execute sql/staging/001_demand.sql and sql/staging/002_weather.sql
+    for the configured ``training_lookback_days`` window.
 
-    The window is ``[now_hour - lookback_days, now_hour)``.  Re-running is
-    idempotent: every upsert uses ``ON CONFLICT DO UPDATE``.
+    Each SQL file deduplicates on event_id, classifies null violations,
+    writes rejects to staging.rejects, then aggregates clean rows into
+    the staging table — all in a single Postgres round-trip per file.
+
+    The total reject and staging-write counts are logged at INFO level.
+    Re-running is fully idempotent (ON CONFLICT in every SQL file).
     """
-    window_end = _floor_hour(datetime.now(timezone.utc))
+    window_end   = _floor_hour(datetime.now(timezone.utc))
     window_start = window_end - timedelta(days=settings.training_lookback_days)
 
     log.info(
@@ -95,20 +71,12 @@ def run_staging(settings: Settings) -> None:
         lookback_days=settings.training_lookback_days,
     )
 
-    con = _duck_con(settings)
-    demand_df = _read_demand(con, settings, window_start, window_end)
-    weather_df = _read_weather(con, settings, window_start, window_end)
-
-    log.info(
-        "staging_read",
-        demand_rows=len(demand_df),
-        weather_rows=len(weather_df),
-    )
+    params  = {"window_start": window_start, "window_end": window_end}
+    runner  = SqlRunner(_SQL_DIR)
 
     conn = psycopg2.connect(settings.postgres_dsn)
     try:
-        _upsert_demand_hourly(conn, demand_df)
-        _upsert_weather_hourly(conn, weather_df)
+        results = runner.run(conn, params)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -116,144 +84,11 @@ def run_staging(settings: Settings) -> None:
     finally:
         conn.close()
 
-    log.info("staging_done")
-
-
-# ---------------------------------------------------------------------------
-# DuckDB reads
-# ---------------------------------------------------------------------------
-
-def _read_demand(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    window_start: datetime,
-    window_end: datetime,
-) -> pd.DataFrame:
-    glob = (
-        f"s3://{_esc(settings.lake_bucket)}"
-        "/raw/demand_events/dt=*/hour=*/data.parquet"
+    total_rejects = sum(int(r.get("rejects_written", 0) or 0) for r in results)
+    total_staging = sum(int(r.get("staging_written", 0) or 0) for r in results)
+    log.info(
+        "staging_done",
+        files_run=len(results),
+        total_rejects=total_rejects,
+        total_staging_upserts=total_staging,
     )
-    try:
-        return con.execute(
-            f"""
-            SELECT
-                city,
-                date_trunc('hour', sim_ts)::TIMESTAMPTZ  AS hour_ts,
-                SUM(quantity::DOUBLE)                     AS total_demand,
-                COUNT(*)                                  AS event_count,
-                AVG(temperature_c::DOUBLE)                AS avg_temp_c
-            FROM read_parquet('{glob}', hive_partitioning = true)
-            WHERE sim_ts >= ? AND sim_ts < ?
-            GROUP BY city, date_trunc('hour', sim_ts)
-            ORDER BY city, hour_ts
-            """,
-            [window_start, window_end],
-        ).df()
-    except duckdb.IOException as exc:
-        log.warning("staging_demand_read_failed", error=str(exc))
-        return pd.DataFrame(
-            columns=["city", "hour_ts", "total_demand", "event_count", "avg_temp_c"]
-        )
-
-
-def _read_weather(
-    con: duckdb.DuckDBPyConnection,
-    settings: Settings,
-    window_start: datetime,
-    window_end: datetime,
-) -> pd.DataFrame:
-    glob = (
-        f"s3://{_esc(settings.lake_bucket)}"
-        "/raw/weather_readings/dt=*/hour=*/data.parquet"
-    )
-    try:
-        return con.execute(
-            f"""
-            SELECT
-                city,
-                date_trunc('hour', polled_at)::TIMESTAMPTZ  AS hour_ts,
-                AVG(temperature_c::DOUBLE)                   AS temperature_c,
-                AVG(humidity_pct::DOUBLE)                    AS humidity_pct,
-                SUM(precip_mm::DOUBLE)                       AS precip_mm
-            FROM read_parquet('{glob}', hive_partitioning = true)
-            WHERE polled_at >= ? AND polled_at < ?
-            GROUP BY city, date_trunc('hour', polled_at)
-            ORDER BY city, hour_ts
-            """,
-            [window_start, window_end],
-        ).df()
-    except duckdb.IOException as exc:
-        log.warning("staging_weather_read_failed", error=str(exc))
-        return pd.DataFrame(
-            columns=["city", "hour_ts", "temperature_c", "humidity_pct", "precip_mm"]
-        )
-
-
-# ---------------------------------------------------------------------------
-# Postgres upserts
-# ---------------------------------------------------------------------------
-
-def _upsert_demand_hourly(
-    conn: psycopg2.extensions.connection,
-    df: pd.DataFrame,
-) -> None:
-    if df.empty:
-        return
-    rows = [
-        (
-            row.city,
-            row.hour_ts,
-            _nan_to_none(row.total_demand),
-            int(row.event_count),
-            _nan_to_none(row.avg_temp_c),
-        )
-        for row in df.itertuples(index=False)
-    ]
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(
-            cur,
-            """
-            INSERT INTO staging.demand_hourly
-                (city, hour_ts, total_demand, event_count, avg_temp_c)
-            VALUES %s
-            ON CONFLICT (city, hour_ts) DO UPDATE SET
-                total_demand = EXCLUDED.total_demand,
-                event_count  = EXCLUDED.event_count,
-                avg_temp_c   = EXCLUDED.avg_temp_c
-            """,
-            rows,
-        )
-    log.info("staging_demand_upserted", rows=len(rows))
-
-
-def _upsert_weather_hourly(
-    conn: psycopg2.extensions.connection,
-    df: pd.DataFrame,
-) -> None:
-    if df.empty:
-        return
-    rows = [
-        (
-            row.city,
-            row.hour_ts,
-            _nan_to_none(row.temperature_c),
-            _nan_to_none(row.humidity_pct),
-            _nan_to_none(row.precip_mm),
-        )
-        for row in df.itertuples(index=False)
-    ]
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(
-            cur,
-            """
-            INSERT INTO staging.weather_hourly
-                (city, hour_ts, temperature_c, humidity_pct, precip_mm)
-            VALUES %s
-            ON CONFLICT (city, hour_ts) DO UPDATE SET
-                temperature_c = EXCLUDED.temperature_c,
-                humidity_pct  = EXCLUDED.humidity_pct,
-                precip_mm     = EXCLUDED.precip_mm
-            """,
-            rows,
-        )
-    log.info("staging_weather_upserted", rows=len(rows))

@@ -9,7 +9,6 @@ requires-python = ">=3.12"
 dependencies = [
     "apscheduler>=3.10",
     "boto3>=1.34",
-    "duckdb>=1.0",
     "holidays>=0.46",
     "numpy>=1.26",
     "pandas>=2.0",
