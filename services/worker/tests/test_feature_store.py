@@ -36,12 +36,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 import structlog.testing
 
+import redis
+
 import app.feature_store as fs_module
 from app.feature_store import _sync_to_redis
 from common.features.registry import (
     BATCH_COMPUTED_AT_FIELD,
     ROUTE_FEATURES,
     ROUTE_REDIS_KEY_PATTERN,
+    SYNC_COMPLETED_AT_KEY,
     Feature,
     Registry,
 )
@@ -190,26 +193,31 @@ class TestFeatureRegistry:
 class TestSyncToRedis:
     """Test _sync_to_redis with fake Postgres cursor and fake Redis pipeline."""
 
-    def _run_sync(
+    def _wire_mocks(
         self,
         rows: list[dict],
         *,
         settings: MagicMock | None = None,
         batch_size: int = 500,
-    ) -> FakePipeline:
-        """Run _sync_to_redis with mocked dependencies; return the fake pipeline.
+        pipeline_factory: type[FakePipeline] = FakePipeline,
+    ) -> tuple[FakePipeline, MagicMock, Any]:
+        """Set up all mocked dependencies and return (pipe, redis_mock, run_fn).
 
-        Pass batch_size to exercise the chunking path (e.g. batch_size=2 with
-        5 rows → 3 pipeline.execute() calls).
+        *run_fn* is a zero-argument callable that invokes ``_sync_to_redis``
+        inside the active patches.  Callers can wrap it in ``pytest.raises``
+        to test failure paths without duplicating mock setup.
+
+        ``fake_pipe.redis`` is set to ``fake_redis`` so sentinel assertions
+        can be written as ``pipe.redis.set.assert_called_once_with(...)``.
         """
         if settings is None:
             settings = _make_settings()
 
-        fake_pipe = FakePipeline()
+        fake_pipe = pipeline_factory()
         fake_redis = MagicMock()
         fake_redis.pipeline.return_value = fake_pipe
+        fake_pipe.redis = fake_redis  # back-reference for sentinel assertions
 
-        # Fake psycopg2 cursor
         fake_cursor = MagicMock()
         fake_cursor.__enter__ = lambda s: s
         fake_cursor.__exit__ = MagicMock(return_value=False)
@@ -220,12 +228,31 @@ class TestSyncToRedis:
         fake_conn.__exit__ = MagicMock(return_value=False)
         fake_conn.cursor.return_value = fake_cursor
 
-        with (
-            patch("app.feature_store.psycopg2.connect", return_value=fake_conn),
-            patch("app.feature_store._make_redis_client", return_value=fake_redis),
-        ):
-            _sync_to_redis(settings, batch_size=batch_size)
+        def run_fn() -> None:
+            with (
+                patch("app.feature_store.psycopg2.connect", return_value=fake_conn),
+                patch("app.feature_store._make_redis_client", return_value=fake_redis),
+            ):
+                _sync_to_redis(settings, batch_size=batch_size)
 
+        return fake_pipe, fake_redis, run_fn
+
+    def _run_sync(
+        self,
+        rows: list[dict],
+        *,
+        settings: MagicMock | None = None,
+        batch_size: int = 500,
+    ) -> FakePipeline:
+        """Run _sync_to_redis successfully; return the FakePipeline.
+
+        ``pipe.redis`` is a MagicMock of the Redis client — use it to assert
+        on sentinel writes (``pipe.redis.set.assert_called_once_with(...)``).
+        """
+        fake_pipe, _fake_redis, run_fn = self._wire_mocks(
+            rows, settings=settings, batch_size=batch_size
+        )
+        run_fn()
         return fake_pipe
 
     # -- Basic write behaviour ------------------------------------------------
@@ -313,6 +340,61 @@ class TestSyncToRedis:
             f"got {pipe.execute_count}"
         )
         assert len(pipe.calls) == 5
+
+    # -- Sync completion sentinel ---------------------------------------------
+
+    def test_sync_sentinel_written_on_success(self):
+        """feat:sync:completed_at is SET after all batches succeed.
+
+        The sentinel's value must match the batch_computed_at field written
+        into every route hash in the same run — the API uses equality of these
+        two values to confirm a route is from a completed run.
+        """
+        pipe = self._run_sync([_make_row("london"), _make_row("tokyo")])
+        pipe.redis.set.assert_called_once()
+        call_key, call_value = pipe.redis.set.call_args[0]
+        assert call_key == SYNC_COMPLETED_AT_KEY, (
+            f"Sentinel written to wrong key: {call_key!r}"
+        )
+        # The value must be a non-empty ISO-8601 UTC timestamp string.
+        assert isinstance(call_value, str) and "T" in call_value and call_value.endswith("+00:00"), (
+            f"Sentinel value does not look like an ISO-8601 UTC timestamp: {call_value!r}"
+        )
+        # The sentinel value must equal the batch_computed_at in the route hashes.
+        _, route_mapping = pipe.calls[0]
+        assert call_value == route_mapping[BATCH_COMPUTED_AT_FIELD], (
+            "Sentinel value differs from batch_computed_at in the route hash — "
+            "the API's equality check would incorrectly flag the route as incomplete."
+        )
+
+    def test_sync_sentinel_not_written_on_pipeline_failure(self):
+        """feat:sync:completed_at must NOT be written if a batch raises.
+
+        If pipe.execute() raises (network error, Redis OOM, etc.), the sentinel
+        must be left at its previous value so the API can detect that the run
+        was incomplete.
+        """
+        class _ExplodingPipeline(FakePipeline):
+            def execute(self) -> list:
+                raise redis.RedisError("simulated pipeline failure")
+
+        fake_pipe, fake_redis, run_fn = self._wire_mocks(
+            [_make_row("london")],
+            pipeline_factory=_ExplodingPipeline,
+        )
+        with pytest.raises(redis.RedisError, match="simulated pipeline failure"):
+            run_fn()
+
+        fake_redis.set.assert_not_called()
+
+    def test_sync_sentinel_not_written_on_empty_rows(self):
+        """feat:sync:completed_at must NOT be written when the mart is empty.
+
+        An empty result set triggers an early return (logged as a warning).
+        The sentinel must not be updated, as no features were written.
+        """
+        pipe = self._run_sync([])
+        pipe.redis.set.assert_not_called()
 
     def test_throughput_info_log_emitted(self):
         """feature_store_redis_sync_done is logged at INFO with all throughput fields."""

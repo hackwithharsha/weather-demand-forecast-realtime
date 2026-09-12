@@ -291,6 +291,127 @@ pipeline is flushed in one network round-trip after all routes are queued).
 
 ---
 
+## Partial-failure handling for the nightly Redis sync
+
+### Context
+
+The nightly sync job writes one Redis hash per route in sequential batches.
+If the process is killed mid-run — OOM, network partition, container restart —
+some routes will have the freshly-computed features from tonight and others
+will still hold last night's values.  The API has no way to tell which routes
+are fresh and which are stale.
+
+Two strategies were considered.
+
+### Option A — shadow key namespace + atomic RENAME
+
+Write all route hashes to a shadow namespace
+(`shadow:feat:route:{id}`) and, once all writes complete, flip
+the shadow keys into the live namespace with `RENAME`.
+
+**Why this was rejected.**
+
+1. **RENAME is incompatible with the HSET multi-writer model.**
+   `RENAME src dst` replaces `dst` *in its entirety*.  As documented in
+   §"HSET vs SET for the feature store", the live key `feat:route:{id}` is
+   intentionally shared between the nightly batch (which writes the 12 offline
+   features) and a future online pipeline (which will update `lead_time_p50` /
+   `lead_time_p90` in near-real-time from the booking stream).  A RENAME from
+   the shadow key would atomically destroy those online-written fields.
+   The problem is fundamental: no amount of engineering around RENAME recovers
+   the per-field coexistence guarantee that HSET provides.
+
+2. **There is no atomic cross-key operation in Redis without Lua.**
+   `RENAME` is per-key and O(1) but not atomic *across* N keys.  A Lua script
+   can rename all N keys in a single server-side pass, but it blocks the Redis
+   event loop for O(N) string copies — potentially tens to hundreds of
+   milliseconds for hundreds of routes.  That is a significant latency spike
+   on a shared Redis instance.
+
+3. **Cross-slot RENAME is illegal in Redis Cluster.**
+   `feat:route:london` and `shadow:feat:route:london` hash to different slots
+   unless both keys use the same hash tag `{route_id}`.  Adding hash tags to
+   every key name is a non-trivial schema migration.
+
+4. **Shadow keys leak on crash.**
+   If the job dies between writing shadow keys and performing the renames, the
+   shadow namespace accumulates indefinitely.  A cleanup job adds operational
+   complexity and is itself a failure surface.
+
+### Option B — accept partial updates; write a sync completion sentinel
+
+Keep the existing HSET-per-key writes exactly as they are.  Add a single
+lightweight sentinel key, `feat:sync:completed_at`, that is written as the
+**very last operation** of a successful `_sync_to_redis()` run and holds the
+`batch_computed_at` value shared by all route hashes in that run.
+
+```
+feat:sync:completed_at  →  "2024-01-17T02:34:11.203+00:00"
+feat:route:london       →  {avg_bookings_90d: "312.5", ...,
+                            batch_computed_at: "2024-01-17T02:34:11.203+00:00"}
+feat:route:tokyo        →  {avg_bookings_90d: "198.0", ...,
+                            batch_computed_at: "2024-01-17T02:34:11.203+00:00"}
+```
+
+**Failure detection.**
+
+After a crash mid-run the sentinel is stale (it holds the previous run's
+`batch_computed_at`) while some route hashes hold the new run's
+`batch_computed_at`.  The comparison is exact:
+
+| `route.batch_computed_at` vs `feat:sync:completed_at` | Meaning |
+|---|---|
+| Equal | Key is confirmed complete — written by a run that finished. |
+| Greater (newer) | Key was written in an in-progress or failed run. |
+| Less (older) | Key is older than the last complete run — extremely stale. |
+
+The API consults the sentinel when serving features and emits a
+feature-freshness alert for any route whose `batch_computed_at` does not
+match `feat:sync:completed_at`.  This is a precise per-route signal, not a
+blanket "something went wrong" alert.
+
+**Why the staleness window is acceptable.**
+
+All route features have `freshness_sla_seconds = 86 400` (24 hours).  The
+sync itself completes in seconds for realistic route counts.  A partial failure
+therefore leaves affected routes stale by at most one nightly SLA period, and
+the APScheduler re-raises exceptions so on-call is paged before the next run.
+Because the Postgres upsert uses `ON CONFLICT DO UPDATE`, a manual re-run of
+the sync for the same `feature_date` is always safe and will restore
+consistency.
+
+### Decision
+
+**Option B.**  The sentinel costs one additional `SET` call per successful
+sync run and adds precise observability without touching the HSET architecture.
+Option A is architecturally incompatible with the multi-writer field model and
+introduces more failure modes than it removes.
+
+### Implementation
+
+`feat:sync:completed_at` is a plain Redis string key (not a hash).  Its value
+is the ISO-8601 UTC `batch_computed_at` string that was written into every
+route hash during the same run.
+
+`_sync_to_redis()` is wrapped in a `try/finally` block so the Redis connection
+is always closed.  The sentinel write lives inside the `try` block after the
+last `pipe.execute()` returns — it is only reachable if every batch succeeded.
+
+```python
+try:
+    for batch in batches:
+        pipe.execute()          # raises on network / Redis error
+    r.set(SYNC_COMPLETED_AT_KEY, batch_computed_at)   # sentinel
+finally:
+    r.close()                   # always runs; no connection leak on failure
+```
+
+The `SYNC_COMPLETED_AT_KEY` constant (`"feat:sync:completed_at"`) lives in
+`common.features.registry` alongside the other Redis key constants so the API
+can import it without depending on the worker package.
+
+---
+
 ## Feature registry: one definition, zero literals
 
 ### Context

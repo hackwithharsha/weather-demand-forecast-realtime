@@ -57,6 +57,7 @@ from common.features.registry import (
     BATCH_COMPUTED_AT_FIELD,
     ROUTE_FEATURES,
     ROUTE_REDIS_KEY_PATTERN,
+    SYNC_COMPLETED_AT_KEY,
 )
 
 from .settings import Settings
@@ -196,53 +197,72 @@ def _sync_to_redis(
     fields_written = 0
     batches_flushed = 0
 
-    # ── Write to Redis in batches ─────────────────────────────────────────
-    for batch_start in range(0, len(rows), batch_size):
-        batch = rows[batch_start : batch_start + batch_size]
-        t_batch = time.monotonic()
+    try:
+        # ── Write to Redis in batches ──────────────────────────────────────
+        for batch_start in range(0, len(rows), batch_size):
+            batch = rows[batch_start : batch_start + batch_size]
+            t_batch = time.monotonic()
 
-        pipe = r.pipeline(transaction=False)
-        batch_fields = 0
+            pipe = r.pipeline(transaction=False)
+            batch_fields = 0
 
-        for row in batch:
-            route_id = row["route_id"]
-            key = ROUTE_REDIS_KEY_PATTERN.format(route_id=route_id)
+            for row in batch:
+                route_id = row["route_id"]
+                key = ROUTE_REDIS_KEY_PATTERN.format(route_id=route_id)
 
-            # Build the field mapping from the registry — no feature-name
-            # strings here.  Null values are excluded; see docstring above.
-            mapping: dict[str, str] = {}
-            for feat in ROUTE_FEATURES:
-                value = row.get(feat.name)
-                if value is not None:
-                    mapping[feat.name] = str(float(value))
+                # Build the field mapping from the registry — no feature-name
+                # strings here.  Null values are excluded; see docstring above.
+                mapping: dict[str, str] = {}
+                for feat in ROUTE_FEATURES:
+                    value = row.get(feat.name)
+                    if value is not None:
+                        mapping[feat.name] = str(float(value))
 
-            # Always write the freshness timestamp even if all features are null.
-            mapping[BATCH_COMPUTED_AT_FIELD] = batch_computed_at
+                # Always write the freshness timestamp even if all features are null.
+                mapping[BATCH_COMPUTED_AT_FIELD] = batch_computed_at
 
-            # HSET writes individual fields atomically.
-            # It does NOT replace the entire key — other fields (e.g. online
-            # features written by a separate pipeline) remain untouched.
-            # See docs/decisions.md §"HSET vs SET for the feature store".
-            pipe.hset(key, mapping=mapping)
-            batch_fields += len(mapping)
+                # HSET writes individual fields atomically.
+                # It does NOT replace the entire key — other fields (e.g. online
+                # features written by a separate pipeline) remain untouched.
+                # See docs/decisions.md §"HSET vs SET for the feature store".
+                pipe.hset(key, mapping=mapping)
+                batch_fields += len(mapping)
 
-        pipe.execute()
-        batches_flushed += 1
+            pipe.execute()
+            batches_flushed += 1
 
-        batch_elapsed = time.monotonic() - t_batch
-        log.debug(
-            "feature_store_batch_flushed",
-            batch_num=batches_flushed,
-            keys=len(batch),
-            fields=batch_fields,
-            elapsed_ms=round(batch_elapsed * 1000),
-            keys_per_s=round(len(batch) / batch_elapsed) if batch_elapsed else None,
-        )
+            batch_elapsed = time.monotonic() - t_batch
+            log.debug(
+                "feature_store_batch_flushed",
+                batch_num=batches_flushed,
+                keys=len(batch),
+                fields=batch_fields,
+                elapsed_ms=round(batch_elapsed * 1000),
+                keys_per_s=round(len(batch) / batch_elapsed) if batch_elapsed else None,
+            )
 
-        routes_synced += len(batch)
-        fields_written += batch_fields
+            routes_synced += len(batch)
+            fields_written += batch_fields
 
-    r.close()
+        # ── Sync completion sentinel ───────────────────────────────────────
+        # Written ONLY after every batch has been flushed successfully.
+        # If any pipe.execute() above raised an exception, this line is never
+        # reached, so the sentinel retains the previous successful run's value.
+        #
+        # The sentinel allows the API to distinguish confirmed-complete route
+        # keys (route.batch_computed_at == sentinel) from keys left in a
+        # partial run (route.batch_computed_at > sentinel — newer than the last
+        # known-good run).
+        #
+        # See docs/decisions.md §"Partial-failure handling for the nightly
+        # Redis sync".
+        r.set(SYNC_COMPLETED_AT_KEY, batch_computed_at)
+
+    finally:
+        # Always close the connection, even if a batch or the sentinel write
+        # raised.  Without this, a mid-run crash would leak the TCP connection
+        # until the server-side idle timeout fires.
+        r.close()
 
     elapsed_s = time.monotonic() - t_start
     log.info(

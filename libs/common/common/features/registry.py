@@ -47,6 +47,7 @@ __all__ = [
     "ROUTE_FEATURES",
     "ROUTE_REDIS_KEY_PATTERN",
     "BATCH_COMPUTED_AT_FIELD",
+    "SYNC_COMPLETED_AT_KEY",
 ]
 
 Source = Literal["batch", "stream"]
@@ -140,6 +141,17 @@ ROUTE_REDIS_KEY_PATTERN: str = "feat:route:{route_id}"
 #: Hash field written alongside feature values that records when the batch ran.
 #: Used by the API to enforce ``freshness_sla_seconds`` and emit staleness alerts.
 BATCH_COMPUTED_AT_FIELD: str = "batch_computed_at"
+
+#: Plain-string Redis key written as the LAST operation of a fully-successful
+#: ``_sync_to_redis()`` run.  Its value equals the ``batch_computed_at``
+#: timestamp shared by every route hash written in that run.
+#:
+#: If this key's value matches a route's ``batch_computed_at`` field, that route
+#: was confirmed complete.  If a route's ``batch_computed_at`` is *newer* than
+#: this sentinel, the route was written in a run that did not finish.
+#:
+#: See docs/decisions.md §"Partial-failure handling for the nightly Redis sync".
+SYNC_COMPLETED_AT_KEY: str = "feat:sync:completed_at"
 
 # Day-of-week order: 1=Mon … 7=Sun (ISO 8601 / PostgreSQL EXTRACT(ISODOW)).
 _DOW_ABBRS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
