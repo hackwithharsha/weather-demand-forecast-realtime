@@ -44,8 +44,8 @@ services:
 
   mock-weather:
     build:
-      context: services/mock-weather
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/mock-weather/Dockerfile
     profiles: [core]
     restart: unless-stopped
     env_file: .env

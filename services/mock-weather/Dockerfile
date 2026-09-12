@@ -1,3 +1,4 @@
+# Build context: repo root  (needed to COPY libs/common)
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -12,14 +13,19 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Install deps before copying source so this layer is cached on code-only changes.
-# Dummy app/__init__.py satisfies hatchling's package discovery during dep install.
-COPY pyproject.toml .
+# 1. Install the shared common library and its deps first.
+#    This layer is invalidated only when libs/common changes.
+COPY libs/common ./libs/common
+RUN uv pip install --system --no-cache ./libs/common
+
+# 2. Install service-level deps.
+#    Dummy app/__init__.py satisfies hatchling during the dep-only install.
+COPY services/mock-weather/pyproject.toml .
 RUN mkdir -p app && touch app/__init__.py \
     && uv pip install --system --no-cache .
 
-# Overwrite with real source
-COPY app/ app/
+# 3. Copy real source last — code changes don't bust the dep layers.
+COPY services/mock-weather/app/ ./app/
 
 USER app
 

@@ -1,20 +1,31 @@
 """
-Response schemas matching the Google Weather API shape.
-Used as documentation and for type-safety in weather.py.
-FastAPI routes return plain dicts so chaos transforms can freely mutate them.
+Response schemas for the Mock Weather API.
+
+Weather schemas  —  mirror the Google Weather API shape (nested, camelCase).
+Admin schemas    —  ChaosStatus and ChaosUpdate for GET/POST /admin/chaos.
+
+Routes return plain dicts rather than these models so that chaos transforms
+(null fields, schema drift) can freely mutate the payload after generation.
+These classes exist for documentation and OpenAPI schema generation.
 """
 
-from pydantic import BaseModel
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
 
 
-class _Unit(BaseModel):
+# ---------------------------------------------------------------------------
+# Shared weather point sub-models
+# ---------------------------------------------------------------------------
+
+class _TemperatureUnit(BaseModel):
     degrees: float
-    unit: str
+    unit: str = "CELSIUS"
 
 
 class _WindSpeed(BaseModel):
     value: float
-    unit: str
+    unit: str = "KILOMETERS_PER_HOUR"
 
 
 class _WindDirection(BaseModel):
@@ -29,12 +40,12 @@ class _Wind(BaseModel):
 
 class _PrecipProbability(BaseModel):
     percent: int
-    type: str
+    type: str = "RAIN"
 
 
 class _PrecipQpf(BaseModel):
     quantity: float
-    unit: str
+    unit: str = "MILLIMETERS"
 
 
 class _Precipitation(BaseModel):
@@ -44,7 +55,7 @@ class _Precipitation(BaseModel):
 
 class _ConditionDesc(BaseModel):
     text: str
-    languageCode: str
+    languageCode: str = "en"
 
 
 class _WeatherCondition(BaseModel):
@@ -55,15 +66,15 @@ class _WeatherCondition(BaseModel):
 
 class _Visibility(BaseModel):
     distance: float
-    unit: str
+    unit: str = "KILOMETERS"
 
 
 class _ObservationPoint(BaseModel):
-    """Fields shared by current conditions and each forecast hour."""
+    """Fields present at every observation point (current and each forecast hour)."""
 
-    temperature: _Unit
-    feelsLike: _Unit
-    dewPoint: _Unit
+    temperature: _TemperatureUnit
+    feelsLike: _TemperatureUnit
+    dewPoint: _TemperatureUnit
     humidity: int
     wind: _Wind
     precipitation: _Precipitation
@@ -72,6 +83,10 @@ class _ObservationPoint(BaseModel):
     visibility: _Visibility
     cloudCover: int
 
+
+# ---------------------------------------------------------------------------
+# Top-level weather responses
+# ---------------------------------------------------------------------------
 
 class CurrentConditions(_ObservationPoint):
     time: str
@@ -92,3 +107,29 @@ class ForecastHour(_ObservationPoint):
 
 class ForecastResponse(BaseModel):
     forecastHours: list[ForecastHour]
+
+
+# ---------------------------------------------------------------------------
+# Admin: chaos state
+# ---------------------------------------------------------------------------
+
+class ChaosStatus(BaseModel):
+    """Current chaos configuration returned by GET and POST /admin/chaos."""
+
+    latency_ms: int = Field(description="Milliseconds of artificial delay per response")
+    error_rate: float = Field(description="Probability (0–1) of returning HTTP 503")
+    null_field_rate: float = Field(description="Probability (0–1) of nulling any response field")
+    schema_drift: bool = Field(description="When true, 'temperature' is renamed to 'temp'")
+
+
+class ChaosUpdate(BaseModel):
+    """
+    Partial update for POST /admin/chaos.
+    Omit a field to leave it unchanged.
+    Send an empty body {} to read current state without modifying anything.
+    """
+
+    latency_ms: int | None = Field(default=None, ge=0)
+    error_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    null_field_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    schema_drift: bool | None = None
