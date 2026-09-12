@@ -1,0 +1,116 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # CORE profile  (postgres + redis)
+  # Start with: make up
+  # ---------------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: [core]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-forecast}
+      POSTGRES_USER:     ${POSTGRES_USER:-forecast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-forecast}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    profiles: [core]
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # STREAMING profile  (redpanda)
+  # Start with: make up-streaming
+  # TODO: define when streaming layer is implemented
+  # ---------------------------------------------------------------------------
+
+  # redpanda:
+  #   image: redpandadata/redpanda:latest
+  #   profiles: [streaming]
+
+  # ---------------------------------------------------------------------------
+  # STORAGE profile  (minio + clickhouse)
+  # Start with: make up-storage
+  # TODO: define when storage layer is implemented
+  # ---------------------------------------------------------------------------
+
+  # minio:
+  #   image: minio/minio:latest
+  #   profiles: [storage]
+
+  # clickhouse:
+  #   image: clickhouse/clickhouse-server:latest
+  #   profiles: [storage]
+
+  # ---------------------------------------------------------------------------
+  # ML profile  (mlflow)
+  # Start with: make up-ml
+  # TODO: define when ML tracking layer is implemented
+  # ---------------------------------------------------------------------------
+
+  # mlflow:
+  #   build: ./infra/mlflow
+  #   profiles: [ml]
+
+  # ---------------------------------------------------------------------------
+  # OBSERVABILITY profile  (prometheus + grafana)
+  # Start with: make up-obs
+  # TODO: define when observability layer is implemented
+  # ---------------------------------------------------------------------------
+
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   profiles: [observability]
+
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   profiles: [observability]
+
+  # ---------------------------------------------------------------------------
+  # APP profile  (api, ingestion, forecaster, frontend)
+  # Start with: make up-app
+  # TODO: define when application services are implemented
+  # ---------------------------------------------------------------------------
+
+  # api:
+  #   build: ./services/api
+  #   profiles: [app]
+
+  # ingestion:
+  #   build: ./services/ingestion
+  #   profiles: [app]
+
+  # forecaster:
+  #   build: ./services/forecaster
+  #   profiles: [app]
+
+  # frontend:
+  #   build: ./services/frontend
+  #   profiles: [app]
+
+volumes:
+  postgres_data:
+  redis_data:
