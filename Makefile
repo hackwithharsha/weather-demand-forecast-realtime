@@ -202,11 +202,47 @@ reset: ## Wipe all volumes and restart core services from scratch
 	$(COMPOSE) $(P_CORE) up -d
 
 # ---------------------------------------------------------------------------
-# Storage / migrations
+# Migrations (Alembic)
 # ---------------------------------------------------------------------------
+
+# Default downgrade step; override on the command line: make migrate-down REV=base
+REV ?= -1
+
 .PHONY: migrate
-migrate: ## Run Alembic migrations against Postgres
-	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic
+migrate: ## Apply all pending migrations (upgrade head)
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic upgrade head
+
+.PHONY: migrate-down
+migrate-down: ## Downgrade one step (REV=-1 default; REV=base to wipe all)
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic downgrade $(REV)
+
+.PHONY: migrate-new
+migrate-new: ## Scaffold an empty migration file  (MSG="short description required")
+	@test -n "$(MSG)" \
+		|| (printf 'Usage: make migrate-new MSG="short description"\n' >&2; exit 1)
+	$(COMPOSE) $(P_TOOLS) run --rm --no-deps alembic revision -m "$(MSG)"
+
+.PHONY: migrate-history
+migrate-history: ## Show full migration history
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic history --verbose
+
+.PHONY: migrate-current
+migrate-current: ## Show the current applied revision
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic current --verbose
+
+.PHONY: migrate-check
+migrate-check: ## Roundtrip test: downgrade base → upgrade head  (DESTRUCTIVE — dev only)
+	@printf '\nmigrate-check: downgrade base (drops all schemas)...\n'
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic downgrade base
+	@printf '\nmigrate-check: upgrade head (recreates all schemas)...\n'
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic upgrade head
+	@printf '\nmigrate-check: current revision\n'
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic current --verbose
+	@printf '\nmigrate-check: OK\n\n'
+
+# ---------------------------------------------------------------------------
+# Lake CLI
+# ---------------------------------------------------------------------------
 
 .PHONY: lake
 lake: ## Run lake CLI (e.g. make lake CMD="list")

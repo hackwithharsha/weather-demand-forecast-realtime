@@ -249,6 +249,10 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-forecast}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-forecast}
+    # Bind-mount the whole alembic directory so that `alembic revision`
+    # writes new migration files back to the host (not lost in the container).
+    volumes:
+      - ./infra/postgres/alembic:/alembic
     depends_on:
       postgres:
         condition: service_healthy

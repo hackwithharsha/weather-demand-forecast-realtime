@@ -22,5 +22,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP SCHEMA IF EXISTS marts")
-    op.execute("DROP SCHEMA IF EXISTS staging")
+    op.execute("DROP SCHEMA IF EXISTS marts CASCADE")
+    op.execute("DROP SCHEMA IF EXISTS staging CASCADE")

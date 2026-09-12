@@ -79,6 +79,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP TABLE IF EXISTS raw.weather_readings")
-    op.execute("DROP TABLE IF EXISTS raw.demand_events")
-    op.execute("DROP SCHEMA IF EXISTS raw")
+    # CASCADE removes tables, indexes, sequences, and any other objects
+    # owned by the schema in one shot, avoiding dependency-order issues.
+    op.execute("DROP SCHEMA IF EXISTS raw CASCADE")

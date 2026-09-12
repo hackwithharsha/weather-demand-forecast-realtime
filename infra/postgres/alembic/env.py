@@ -11,16 +11,25 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Read DATABASE_URL from environment, overriding the ini placeholder.
-database_url = os.environ["DATABASE_URL"]
-config.set_main_option("sqlalchemy.url", database_url)
+# Inject DATABASE_URL before anything reads sqlalchemy.url from the config.
+# The ini file carries only a dummy placeholder; the real URL is always
+# provided through the environment (set by docker-compose or make targets).
+_db_url = os.environ.get("DATABASE_URL")
+if not _db_url:
+    raise RuntimeError(
+        "DATABASE_URL environment variable is required but not set.\n"
+        "Run migrations via  make migrate  which injects this variable,\n"
+        "or export DATABASE_URL before calling alembic directly."
+    )
+config.set_main_option("sqlalchemy.url", _db_url)
 
+# No SQLAlchemy ORM models — migrations use raw SQL via op.execute().
 target_metadata = None
 
 
 def run_migrations_offline() -> None:
     context.configure(
-        url=database_url,
+        url=_db_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
