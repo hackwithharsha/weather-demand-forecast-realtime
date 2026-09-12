@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS raw.demand_events (
     kafka_partition  SMALLINT,
     kafka_offset     BIGINT,
     schema_version   SMALLINT,
-    event_id         TEXT,
-    received_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
+    event_id         TEXT          UNIQUE,
+    ingested_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS raw_demand_events_city_sim_ts
@@ -47,8 +47,8 @@ CREATE TABLE IF NOT EXISTS raw.weather_readings (
     kafka_partition        SMALLINT,
     kafka_offset           BIGINT,
     schema_version         SMALLINT,
-    event_id               TEXT,
-    received_at            TIMESTAMPTZ   NOT NULL DEFAULT now()
+    event_id               TEXT          UNIQUE,
+    ingested_at            TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS raw_weather_readings_city_polled_at
