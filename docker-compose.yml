@@ -1,14 +1,14 @@
 services:
 
   # ---------------------------------------------------------------------------
-  # CORE profile  (postgres + redis)
-  # Start with: make up
+  # core  –  postgres + redis
   # ---------------------------------------------------------------------------
 
   postgres:
     image: postgres:16-alpine
     profiles: [core]
     restart: unless-stopped
+    env_file: .env
     environment:
       POSTGRES_DB:       ${POSTGRES_DB:-forecast}
       POSTGRES_USER:     ${POSTGRES_USER:-forecast}
@@ -29,6 +29,7 @@ services:
     image: redis:7-alpine
     profiles: [core]
     restart: unless-stopped
+    env_file: .env
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     volumes:
       - redis_data:/data
@@ -42,74 +43,64 @@ services:
       start_period: 5s
 
   # ---------------------------------------------------------------------------
-  # STREAMING profile  (redpanda)
-  # Start with: make up-streaming
+  # stream  –  redpanda
   # TODO: define when streaming layer is implemented
   # ---------------------------------------------------------------------------
 
   # redpanda:
   #   image: redpandadata/redpanda:latest
-  #   profiles: [streaming]
+  #   profiles: [stream]
 
   # ---------------------------------------------------------------------------
-  # STORAGE profile  (minio + clickhouse)
-  # Start with: make up-storage
-  # TODO: define when storage layer is implemented
+  # ml  –  clickhouse, minio, mlflow
+  # TODO: define when ML/storage layer is implemented
   # ---------------------------------------------------------------------------
-
-  # minio:
-  #   image: minio/minio:latest
-  #   profiles: [storage]
 
   # clickhouse:
   #   image: clickhouse/clickhouse-server:latest
-  #   profiles: [storage]
+  #   profiles: [ml]
 
-  # ---------------------------------------------------------------------------
-  # ML profile  (mlflow)
-  # Start with: make up-ml
-  # TODO: define when ML tracking layer is implemented
-  # ---------------------------------------------------------------------------
+  # minio:
+  #   image: minio/minio:latest
+  #   profiles: [ml]
 
   # mlflow:
   #   build: ./infra/mlflow
   #   profiles: [ml]
 
   # ---------------------------------------------------------------------------
-  # OBSERVABILITY profile  (prometheus + grafana)
-  # Start with: make up-obs
+  # obs  –  prometheus, grafana
   # TODO: define when observability layer is implemented
   # ---------------------------------------------------------------------------
 
   # prometheus:
   #   image: prom/prometheus:latest
-  #   profiles: [observability]
+  #   profiles: [obs]
 
   # grafana:
   #   image: grafana/grafana:latest
-  #   profiles: [observability]
+  #   profiles: [obs]
 
   # ---------------------------------------------------------------------------
-  # APP profile  (api, ingestion, forecaster, frontend)
-  # Start with: make up-app
+  # ui  –  api, ingestion, forecaster, frontend
   # TODO: define when application services are implemented
   # ---------------------------------------------------------------------------
 
   # api:
   #   build: ./services/api
-  #   profiles: [app]
+  #   profiles: [ui]
 
   # ingestion:
   #   build: ./services/ingestion
-  #   profiles: [app]
+  #   profiles: [ui]
 
   # forecaster:
   #   build: ./services/forecaster
-  #   profiles: [app]
+  #   profiles: [ui]
 
   # frontend:
   #   build: ./services/frontend
-  #   profiles: [app]
+  #   profiles: [ui]
 
 volumes:
   postgres_data:
