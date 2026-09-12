@@ -35,6 +35,13 @@ class Settings(BaseSettings):
         description="Consumer group for weather.readings.v1",
     )
 
+    # MinIO / Parquet lake
+    minio_endpoint_url:       str = "http://minio:9000"
+    minio_access_key:         str = Field(default="minioadmin", alias="MINIO_ACCESS_KEY")
+    minio_secret_key:         str = Field(default="minioadmin", alias="MINIO_SECRET_KEY")
+    lake_bucket:              str = "lake"
+    parquet_flush_interval_s: int = 60
+
     @property
     def postgres_dsn(self) -> str:
         return (

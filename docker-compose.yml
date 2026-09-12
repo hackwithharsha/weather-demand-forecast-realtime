@@ -63,6 +63,42 @@ services:
       retries: 3
       start_period: 15s
 
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    profiles: [core]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  minio-init:
+    image: minio/mc
+    profiles: [core]
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    volumes:
+      - ./infra/minio/buckets.sh:/buckets.sh:ro
+    entrypoint: ["/bin/sh", "/buckets.sh"]
+
   # ---------------------------------------------------------------------------
   # stream  –  redpanda + console + producers + ingestor
   # ---------------------------------------------------------------------------
@@ -181,6 +217,8 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       POSTGRES_HOST:            postgres
       POSTGRES_PORT:            5432
@@ -191,19 +229,47 @@ services:
       DEMAND_TOPIC:             demand.events.v1
       WEATHER_TOPIC:            weather.readings.v1
       DLQ_TOPIC:                demand.events.dlq
+      MINIO_ENDPOINT_URL:       http://minio:9000
+      MINIO_ACCESS_KEY:         ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY:         ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      LAKE_BUCKET:              lake
+      PARQUET_FLUSH_INTERVAL_S: ${PARQUET_FLUSH_INTERVAL_S:-60}
 
   # ---------------------------------------------------------------------------
-  # ml  –  clickhouse, minio, mlflow
-  # TODO: define when ML/storage layer is implemented
+  # tools  –  alembic migrations + lake CLI
   # ---------------------------------------------------------------------------
 
-  # clickhouse:
-  #   image: clickhouse/clickhouse-server:latest
-  #   profiles: [ml]
+  alembic:
+    build:
+      context: infra/postgres/alembic
+    profiles: [tools]
+    restart: "no"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-forecast}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-forecast}
+    depends_on:
+      postgres:
+        condition: service_healthy
 
-  # minio:
-  #   image: minio/minio:latest
-  #   profiles: [ml]
+  lake:
+    build:
+      context: tools
+    profiles: [tools]
+    restart: "no"
+    env_file: .env
+    environment:
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_ACCESS_KEY:   ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY:   ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      LAKE_BUCKET:        lake
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # ml  –  mlflow
+  # TODO: define when ML tracking layer is implemented
+  # ---------------------------------------------------------------------------
 
   # mlflow:
   #   build: ./infra/mlflow
@@ -247,3 +313,4 @@ volumes:
   postgres_data:
   redis_data:
   redpanda_data:
+  minio_data:

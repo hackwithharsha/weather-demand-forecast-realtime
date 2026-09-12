@@ -3,10 +3,11 @@ COMPOSE := docker compose
 # Profile flag helpers
 P_CORE   := --profile core
 P_STREAM := --profile stream
+P_TOOLS  := --profile tools
 P_ML     := --profile ml
 P_OBS    := --profile obs
 P_UI     := --profile ui
-P_ALL    := $(P_CORE) $(P_STREAM) $(P_ML) $(P_OBS) $(P_UI)
+P_ALL    := $(P_CORE) $(P_STREAM) $(P_TOOLS) $(P_ML) $(P_OBS) $(P_UI)
 
 .DEFAULT_GOAL := help
 
@@ -199,6 +200,17 @@ verify: ## Assert infra healthy; validate mock-weather schema and chaos toggle
 reset: ## Wipe all volumes and restart core services from scratch
 	$(COMPOSE) $(P_ALL) down -v --remove-orphans
 	$(COMPOSE) $(P_CORE) up -d
+
+# ---------------------------------------------------------------------------
+# Storage / migrations
+# ---------------------------------------------------------------------------
+.PHONY: migrate
+migrate: ## Run Alembic migrations against Postgres
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm alembic
+
+.PHONY: lake
+lake: ## Run lake CLI (e.g. make lake CMD="list")
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm lake $(CMD)
 
 # ---------------------------------------------------------------------------
 # Utilities

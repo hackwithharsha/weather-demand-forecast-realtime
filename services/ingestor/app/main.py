@@ -21,6 +21,7 @@ from .consumers import (
     demand_consumer_loop,
     weather_consumer_loop,
 )
+from .parquet_writer import ParquetWriter
 from .settings import Settings
 
 log = structlog.get_logger()
@@ -53,22 +54,26 @@ def main() -> None:
         name="weather-consumer",
         daemon=False,
     )
+    parquet_thread = ParquetWriter(settings, stop_event)
 
     log.info(
         "ingestor_started",
         demand_topic=settings.demand_topic,
         weather_topic=settings.weather_topic,
         dlq_topic=settings.dlq_topic,
+        parquet_flush_interval_s=settings.parquet_flush_interval_s,
     )
 
     demand_thread.start()
     weather_thread.start()
+    parquet_thread.start()
 
     # Block until a signal is received, then wait for threads to finish
     stop_event.wait()
     log.info("stopping_consumers")
     demand_thread.join(timeout=15)
     weather_thread.join(timeout=15)
+    parquet_thread.join(timeout=30)
 
     dlq_producer.flush(timeout=10)
     log.info("ingestor_stopped")
