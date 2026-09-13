@@ -26,11 +26,12 @@ Feature-loading strategy
 1. Base features (lag/rolling/event_count/humidity_pct) are read from
    ``marts.city_hour_features`` (latest row per city) via asyncpg.
 
-2. Real-time weather override: the stream worker publishes current weather to
-   ``feat:route:{city}`` in Redis (fields: weather_temp_c, weather_precip_mm).
-   If both fields are present the Postgres weather values are overridden;
-   otherwise the Postgres values are kept.  Redis hits/misses are counted and
-   logged at every 200th request.
+2. Real-time weather override: ``features/online.py`` issues a single
+   ``HGETALL`` against ``feat:route:{city}``, validates every registered field
+   against its SLA, applies registry defaults for missing fields, and returns
+   an ``OnlineResult``.  Non-``None`` values overlay the Postgres base.
+   Per-field miss counters accumulate in ``_miss_counts`` (module-level in
+   ``online.py``) and are exposed via ``/model/info``.
 
 Shadow scoring
 --------------
@@ -66,6 +67,7 @@ import structlog
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from .features.online import fetch_online_features, get_miss_counts
 from .settings import Settings
 
 log = structlog.get_logger()
@@ -91,10 +93,6 @@ FEATURE_COLS: list[str] = [
     "precip_mm",
     "is_holiday",
 ]
-
-# Redis key where the stream worker stores current weather per city.
-# Fields used: weather_temp_c, weather_precip_mm.
-_CITY_REDIS_KEY = "feat:route:{city}"
 
 
 # ---------------------------------------------------------------------------
@@ -389,13 +387,22 @@ class HourForecast(BaseModel):
     predicted_demand: float
 
 
+class FeatureStatus(BaseModel):
+    """Online-feature retrieval outcome included in every /predict response."""
+
+    hash_present: bool          # False → Redis key absent or HGETALL failed
+    age_s: float | None = None  # seconds since stream_computed_at; None if unparseable
+    missing: list[str] = []     # Redis field names absent from the hash
+    degraded: list[str] = []    # model col names whose SLA was breached (value still served)
+
+
 class PredictResponse(BaseModel):
     city: str
-    as_of: str              # ISO-8601 UTC when the prediction was made
+    as_of: str                      # ISO-8601 UTC when the prediction was made
     horizon_hours: int
     model_version: str
-    source: str             # always "production"
-    feature_source: str     # "redis+postgres" | "postgres"
+    source: str                     # always "production"
+    feature_status: FeatureStatus   # online-feature retrieval outcome
     forecasts: list[HourForecast]
 
 
@@ -432,21 +439,6 @@ async def _pg_latest_features(city: str) -> dict | None:
     )
     return dict(row) if row else None
 
-
-async def _redis_weather(city: str) -> dict | None:
-    """Try to fetch real-time weather from the stream worker's Redis hash.
-
-    Returns {'temperature_c': float, 'precip_mm': float} or None.
-    Fields are written by the stream worker as weather_temp_c / weather_precip_mm.
-    """
-    key = _CITY_REDIS_KEY.format(city=city)
-    try:
-        vals = await _state.redis.hmget(key, "weather_temp_c", "weather_precip_mm")
-        if vals[0] is not None and vals[1] is not None:
-            return {"temperature_c": float(vals[0]), "precip_mm": float(vals[1])}
-    except Exception as exc:
-        log.debug("redis_weather_miss", city=city, error=str(exc))
-    return None
 
 
 def _time_feats(ts: datetime) -> dict:
@@ -509,16 +501,20 @@ async def _do_predict(city: str, horizon_hours: int) -> dict:
         raise HTTPException(404, f"No feature data for city {city!r}. "
                                  "Has the mart pipeline run yet?")
 
-    # 2. Real-time weather override from Redis
-    rw = await _redis_weather(city)
-    if rw is not None:
+    # 2. Real-time weather override from Redis (via features/online.py)
+    #    fetch_online_features issues a single HGETALL, validates each field
+    #    against its SLA, and applies registry defaults for missing fields.
+    #    Only non-None values are overlaid on the Postgres base.
+    online = await fetch_online_features(city, _state.redis, as_of)
+    for col, val in online.values.items():
+        if val is not None:
+            base[col] = val
+
+    # Maintain hash-level hit/miss counters for the /model/info summary.
+    if online.hash_present:
         _state.redis_hits += 1
-        base["temperature_c"] = rw["temperature_c"]
-        base["precip_mm"] = rw["precip_mm"]
-        feat_src = "redis+postgres"
     else:
         _state.redis_misses += 1
-        feat_src = "postgres"
 
     total = _state.redis_hits + _state.redis_misses
     if total > 0 and total % 200 == 0:
@@ -528,6 +524,13 @@ async def _do_predict(city: str, horizon_hours: int) -> dict:
             redis_misses=_state.redis_misses,
             miss_pct=round(_state.redis_misses / total * 100, 1),
         )
+
+    feature_status = {
+        "hash_present": online.hash_present,
+        "age_s": online.age_s,
+        "missing": online.missing,
+        "degraded": online.degraded,
+    }
 
     # 3. Build feature matrix
     df = _build_rows(city, horizon_hours, base, as_of)
@@ -552,7 +555,7 @@ async def _do_predict(city: str, horizon_hours: int) -> dict:
         "horizon_hours": horizon_hours,
         "model_version": prod_ver,
         "source": "production",
-        "feature_source": feat_src,
+        "feature_status": feature_status,
         "forecasts": [
             {
                 "target_hour": (base_hour + timedelta(hours=h)).isoformat(),
@@ -643,9 +646,10 @@ async def model_info() -> dict:
             "miss_rate_pct": (
                 round(_state.redis_misses / total * 100, 2) if total else None
             ),
+            "per_field_miss_counts": get_miss_counts(),
             "description": (
-                "A 'miss' means Redis had no live weather for the city; "
-                "Postgres weather was used instead."
+                "redis_hits/misses count hash-level presence (one per request). "
+                "per_field_miss_counts counts individual field absences since process start."
             ),
         },
     }
