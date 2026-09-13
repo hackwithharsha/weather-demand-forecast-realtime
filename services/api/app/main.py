@@ -67,7 +67,12 @@ import structlog
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from .features.online import OnlineResult, fetch_online_features, get_miss_counts
+from .features.online import (
+    ONLINE_FEATURES,
+    OnlineResult,
+    fetch_online_features,
+    get_miss_counts,
+)
 from .settings import Settings
 
 log = structlog.get_logger()
@@ -420,6 +425,7 @@ async def _pg_latest_features(city: str) -> dict | None:
     row = await _state.pg.fetchrow(
         """
         SELECT
+            hour_ts,
             event_count,
             demand_lag_1h,
             demand_lag_24h,
@@ -500,6 +506,7 @@ async def _do_predict(city: str, horizon_hours: int) -> dict:
     if base is None:
         raise HTTPException(404, f"No feature data for city {city!r}. "
                                  "Has the mart pipeline run yet?")
+    mart_hour_ts = base.get("hour_ts")  # datetime from asyncpg; None-safe
 
     # 2. Real-time weather override from Redis (via features/online.py)
     #    fetch_online_features issues a single HGETALL, validates each field
@@ -554,6 +561,7 @@ async def _do_predict(city: str, horizon_hours: int) -> dict:
         as_of=as_of,
         prod_latency_ms=prod_latency_ms,
         online=online,
+        mart_hour_ts=mart_hour_ts,
     ))
 
     # 6. Assemble response
@@ -585,6 +593,7 @@ async def _shadow_task(
     as_of: datetime,
     prod_latency_ms: float,
     online: OnlineResult,
+    mart_hour_ts: datetime | None,
 ) -> None:
     """Run Staging model on the same features, then persist both predictions.
 
@@ -622,7 +631,7 @@ async def _shadow_task(
     except Exception as exc:
         log.warning("shadow_score_failed", city=city, error=str(exc))
 
-    # ── Persist to prediction_log ─────────────────────────────────────────
+    # ── Persist to prediction_log + prediction_features ──────────────────
     if _state.pg is None:
         return
     try:
@@ -631,6 +640,22 @@ async def _shadow_task(
                 return int(v) if v is not None else None
             except (ValueError, TypeError):
                 return None
+
+        def _pf(v) -> float | None:
+            """numpy/pandas scalar → Python float; NaN/None → None."""
+            if v is None:
+                return None
+            f = float(v)
+            return None if math.isnan(f) else f
+
+        # Which online fields were actually served from Redis (not missing/fallback)
+        online_source = [
+            of.feature.name for of in ONLINE_FEATURES
+            if of.feature.name not in set(online.missing)
+        ]
+
+        # Row 0 of df has the base feature values used for all horizon steps.
+        feat = df.iloc[0]
 
         async with _state.pg.acquire() as conn:
             await conn.execute(
@@ -660,6 +685,51 @@ async def _shadow_task(
                 online.missing or [],
                 online.degraded or [],
             )
+
+            await conn.execute(
+                """
+                INSERT INTO marts.prediction_features (
+                    requested_at, city, model_version,
+                    event_count,
+                    demand_lag_1h, demand_lag_24h, demand_lag_168h,
+                    demand_roll_3h, demand_roll_24h,
+                    hour_sin, hour_cos, dow_sin, dow_cos,
+                    temperature_c, humidity_pct, precip_mm, is_holiday,
+                    mart_hour_ts,
+                    online_age_s, online_source, online_degraded, online_missing
+                ) VALUES (
+                    $1,  $2,  $3,
+                    $4,
+                    $5,  $6,  $7,
+                    $8,  $9,
+                    $10, $11, $12, $13,
+                    $14, $15, $16, $17,
+                    $18,
+                    $19, $20, $21, $22
+                )
+                """,
+                as_of, city, _parse_ver(prod_ver),
+                _pf(feat["event_count"]),
+                _pf(feat["demand_lag_1h"]),
+                _pf(feat["demand_lag_24h"]),
+                _pf(feat["demand_lag_168h"]),
+                _pf(feat["demand_roll_3h"]),
+                _pf(feat["demand_roll_24h"]),
+                _pf(feat["hour_sin"]),
+                _pf(feat["hour_cos"]),
+                _pf(feat["dow_sin"]),
+                _pf(feat["dow_cos"]),
+                _pf(feat["temperature_c"]),
+                _pf(feat["humidity_pct"]),
+                _pf(feat["precip_mm"]),
+                _pf(feat["is_holiday"]),
+                mart_hour_ts,
+                online.age_s,
+                online_source,
+                online.degraded or [],
+                online.missing or [],
+            )
+
         log.debug(
             "prediction_logged",
             city=city,

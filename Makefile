@@ -263,6 +263,10 @@ lake: ## Run lake CLI (e.g. make lake CMD="list")
 lake-counts: ## City event counts for the last 3 hours  (TABLE=demand_events)
 	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm lake counts ${TABLE:-demand_events} --last 3
 
+.PHONY: check-skew
+check-skew: ## Diff serving feature vectors vs warehouse; report training-serving skew count
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm skew-check
+
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
