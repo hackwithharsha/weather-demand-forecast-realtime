@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-gray-950 text-gray-100 antialiased;
+}
+
+/* Recharts defaults reset for dark background */
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: #1f2937; /* gray-800 */
+}
+
+.recharts-text {
+  fill: #9ca3af; /* gray-400 */
+  font-size: 11px;
+}
+
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  background-color: #111827 !important; /* gray-900 */
+  border: 1px solid #1f2937 !important; /* gray-800 */
+  border-radius: 8px;
+}
+
+.recharts-legend-item-text {
+  color: #d1d5db !important; /* gray-300 */
+  font-size: 12px;
+}

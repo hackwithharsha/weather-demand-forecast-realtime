@@ -7,6 +7,7 @@ P_TOOLS  := --profile tools
 P_ML     := --profile ml
 P_OBS    := --profile obs
 P_UI     := --profile ui
+P_UI_DEV := --profile ui-dev
 P_ALL    := $(P_CORE) $(P_STREAM) $(P_TOOLS) $(P_ML) $(P_OBS) $(P_UI)
 
 .DEFAULT_GOAL := help
@@ -39,8 +40,12 @@ up-obs: ## Start core + observability services (prometheus, grafana, pushgateway
 	$(COMPOSE) $(P_CORE) $(P_OBS) up -d
 
 .PHONY: up-ui
-up-ui: ## Start core + application services (api, ingestion, forecaster, frontend)
+up-ui: ## Start core + UI services (postgres, redis, minio, api, ui dashboard on :5173)
 	$(COMPOSE) $(P_CORE) $(P_UI) up -d
+
+.PHONY: dev-ui
+dev-ui: ## Start Vite HMR dev server on :5173 (edit src/ → browser updates instantly)
+	$(COMPOSE) $(P_CORE) $(P_UI_DEV) up -d
 
 .PHONY: up-all
 up-all: ## Start all services

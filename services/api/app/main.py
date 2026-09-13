@@ -901,6 +901,118 @@ async def ws_live(ws: WebSocket) -> None:
         log.info("ws_disconnected", subscribers=len(_state.ws_subscribers))
 
 
+@app.get("/model/versions")
+async def model_versions() -> dict:
+    """List every registered version of the demand-forecaster model with metrics."""
+    settings = _state.settings
+    if settings is None:
+        raise HTTPException(503, "Service not initialised")
+
+    def _fetch() -> list[dict]:
+        mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+        client = mlflow.tracking.MlflowClient()
+        model_name = settings.mlflow_registered_model_name
+        all_vs = client.search_model_versions(f"name='{model_name}'", max_results=1000)
+        out = []
+        for v in sorted(all_vs, key=lambda x: int(x.version), reverse=True):
+            try:
+                val_mae = client.get_run(v.run_id).data.metrics.get("val_mae")
+            except Exception:
+                val_mae = None
+            created_at = (
+                datetime.fromtimestamp(v.creation_timestamp / 1000, tz=timezone.utc).isoformat()
+                if v.creation_timestamp
+                else None
+            )
+            out.append(
+                {
+                    "version": int(v.version),
+                    "stage": v.current_stage,
+                    "run_id": v.run_id,
+                    "val_mae": round(val_mae, 6) if val_mae is not None else None,
+                    "created_at": created_at,
+                    "tags": {
+                        k: val
+                        for k, val in v.tags.items()
+                        if not k.startswith("mlflow.")
+                    },
+                }
+            )
+        return out
+
+    try:
+        versions = await asyncio.get_running_loop().run_in_executor(None, _fetch)
+    except Exception as exc:
+        log.error("model_versions_failed", error=str(exc))
+        raise HTTPException(503, f"MLflow unavailable: {exc}") from exc
+    return {"versions": versions}
+
+
+@app.post("/admin/promote")
+async def admin_promote() -> dict:
+    """Promote the highest Staging version to Production, then reload both models.
+
+    Returns 409 when there is no Staging version to promote.
+    Holds the reload lock so concurrent calls queue rather than double-load.
+    """
+    settings = _state.settings
+    if settings is None:
+        raise HTTPException(503, "Service not initialised")
+
+    async with _state.reload_lock:
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _do_promote() -> int:
+                mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+                client = mlflow.tracking.MlflowClient()
+                model_name = settings.mlflow_registered_model_name
+                all_vs = client.search_model_versions(
+                    f"name='{model_name}'", max_results=1000
+                )
+                staging_vs = [v for v in all_vs if v.current_stage == "Staging"]
+                if not staging_vs:
+                    raise ValueError("No Staging version to promote")
+                sv = max(staging_vs, key=lambda v: int(v.version))
+                client.transition_model_version_stage(
+                    name=model_name,
+                    version=sv.version,
+                    stage="Production",
+                    archive_existing_versions=True,
+                )
+                return int(sv.version)
+
+            promoted_version = await loop.run_in_executor(None, _do_promote)
+
+            prod_m, prod_info, staging_m, staging_info = await loop.run_in_executor(
+                None, _do_load_models, settings
+            )
+            _state.prod_model = prod_m
+            _state.prod_info = prod_info
+            _state.staging_model = staging_m
+            _state.staging_info = staging_info
+
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except Exception as exc:
+            log.error("admin_promote_failed", error=str(exc))
+            raise HTTPException(500, f"Promote failed: {exc}") from exc
+
+    log.info(
+        "admin_promote_complete",
+        promoted_version=promoted_version,
+        new_prod=_state.prod_info.get("version"),
+    )
+    return {
+        "status": "promoted",
+        "promoted_version": promoted_version,
+        "production_version": str(_state.prod_info.get("version")),
+        "staging_version": (
+            str(_state.staging_info["version"]) if _state.staging_info else None
+        ),
+    }
+
+
 @app.post("/admin/reload")
 async def admin_reload() -> dict:
     """Hot-swap Production and Staging models from the MLflow registry.

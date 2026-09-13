@@ -589,7 +589,7 @@ services:
       start_period: 20s
 
   # ---------------------------------------------------------------------------
-  # ui  –  ingestion, forecaster, frontend (placeholders)
+  # ui  –  React + Vite + nginx dashboard
   # ---------------------------------------------------------------------------
 
   # ingestion:
@@ -600,9 +600,44 @@ services:
   #   build: ./services/forecaster
   #   profiles: [ui]
 
-  # frontend:
-  #   build: ./services/frontend
-  #   profiles: [ui]
+  # Production build: nginx serves the Vite bundle and proxies /api /ws /prom.
+  ui:
+    build:
+      context: services/ui
+      target: serve          # nginx stage — tsc + vite build baked in
+    profiles: [ui]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    # nginx proxies (see services/ui/nginx.conf):
+    #   /api/  → http://api:8000/       (REST)
+    #   /ws/   → ws://api:8000/ws/      (WebSocket + Upgrade header)
+    #   /prom/ → http://prometheus:9090/ (obs profile only; 502 handled in JS)
+
+  # Dev build: Vite HMR server with bind-mounted source.
+  # src/ and index.html are live — save a file, browser updates instantly.
+  # Config files (vite.config.ts, tailwind.config.ts, package.json) are baked
+  # into the dev image; rebuild with: docker compose build ui-dev
+  ui-dev:
+    build:
+      context: services/ui
+      target: dev            # node stage — no nginx, runs `npm run dev`
+    profiles: [ui-dev]
+    restart: unless-stopped
+    volumes:
+      - ./services/ui/src:/app/src           # React source → HMR
+      - ./services/ui/index.html:/app/index.html  # HTML entry → HMR
+    environment:
+      API_TARGET:  http://api:8000
+      PROM_TARGET: http://prometheus:9090
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   postgres_data:
