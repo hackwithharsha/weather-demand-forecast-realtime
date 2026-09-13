@@ -315,7 +315,7 @@ services:
   bench:
     build:
       context: tools
-    profiles: [tools]
+    profiles: [ml]
     restart: "no"
     env_file: .env
     entrypoint: ["python", "-m", "tools.bench"]

@@ -67,7 +67,7 @@ import structlog
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from .features.online import fetch_online_features, get_miss_counts
+from .features.online import OnlineResult, fetch_online_features, get_miss_counts
 from .settings import Settings
 
 log = structlog.get_logger()
@@ -538,14 +538,23 @@ async def _do_predict(city: str, horizon_hours: int) -> dict:
     # 4. Production inference (blocking sklearn call in thread executor)
     loop = asyncio.get_running_loop()
     prod_model = _state.prod_model
+    _t0 = loop.time()
     preds: np.ndarray = await loop.run_in_executor(
         None, prod_model.predict, df
     )
+    prod_latency_ms = (loop.time() - _t0) * 1000
     prod_ver = str(_state.prod_info.get("version", "unknown"))
 
-    # 5. Shadow-score Staging in background (fire-and-forget)
-    if _state.staging_model is not None:
-        asyncio.create_task(_shadow_task(df.copy(), preds.copy(), city, prod_ver))
+    # 5. Shadow-score Staging + persist both to prediction_log (fire-and-forget).
+    #    Always fires regardless of whether Staging is loaded so that Production
+    #    predictions are always auditable.  Never allowed to raise into the caller.
+    asyncio.create_task(_shadow_task(
+        df.copy(), preds.copy(), city, prod_ver,
+        horizon_hours=horizon_hours,
+        as_of=as_of,
+        prod_latency_ms=prod_latency_ms,
+        online=online,
+    ))
 
     # 6. Assemble response
     base_hour = as_of.replace(minute=0, second=0, microsecond=0)
@@ -571,32 +580,95 @@ async def _shadow_task(
     prod_preds: np.ndarray,
     city: str,
     prod_ver: str,
+    *,
+    horizon_hours: int,
+    as_of: datetime,
+    prod_latency_ms: float,
+    online: OnlineResult,
 ) -> None:
-    """Run Staging model on the same features and log the comparison.
+    """Run Staging model on the same features, then persist both predictions.
 
-    Never raises — errors are logged as warnings.
+    Always writes a row to ``marts.prediction_log`` — even when no Staging model
+    is loaded — so every Production prediction is auditable.
+
+    Never raises.  All errors (staging inference, DB write) are caught and
+    logged as warnings so the caller's response is never affected.
     """
+    staging_preds: np.ndarray | None = None
+    staging_ver: str | None = None
+    staging_latency_ms: float | None = None
+
+    # ── Staging inference (optional) ─────────────────────────────────────
     try:
         staging_m = _state.staging_model
-        if staging_m is None:
-            return
-        loop = asyncio.get_running_loop()
-        staging_preds: np.ndarray = await loop.run_in_executor(
-            None, staging_m.predict, df
-        )
-        staging_ver = str(_state.staging_info.get("version", "unknown"))
-        log.info(
-            "shadow_score",
+        if staging_m is not None:
+            loop = asyncio.get_running_loop()
+            _t0 = loop.time()
+            staging_preds = await loop.run_in_executor(None, staging_m.predict, df)
+            staging_latency_ms = (loop.time() - _t0) * 1000
+            staging_ver = str(_state.staging_info.get("version", "unknown"))
+            log.info(
+                "shadow_score",
+                city=city,
+                prod_version=prod_ver,
+                staging_version=staging_ver,
+                prod_mean=round(float(np.mean(prod_preds)), 4),
+                staging_mean=round(float(np.mean(staging_preds)), 4),
+                delta=round(float(np.mean(staging_preds - prod_preds)), 4),
+                n_hours=horizon_hours,
+                prod_latency_ms=round(prod_latency_ms, 2),
+                staging_latency_ms=round(staging_latency_ms, 2),
+            )
+    except Exception as exc:
+        log.warning("shadow_score_failed", city=city, error=str(exc))
+
+    # ── Persist to prediction_log ─────────────────────────────────────────
+    if _state.pg is None:
+        return
+    try:
+        def _parse_ver(v: str | None) -> int | None:
+            try:
+                return int(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+
+        async with _state.pg.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO marts.prediction_log (
+                    requested_at, city, horizon_hours,
+                    prod_version, prod_preds, prod_latency_ms,
+                    staging_version, staging_preds, staging_latency_ms,
+                    feature_hash_present, feature_age_s,
+                    feature_missing, feature_degraded
+                ) VALUES (
+                    $1,  $2,  $3,
+                    $4,  $5,  $6,
+                    $7,  $8,  $9,
+                    $10, $11, $12, $13
+                )
+                """,
+                as_of, city, horizon_hours,
+                _parse_ver(prod_ver),
+                prod_preds.tolist(),
+                round(prod_latency_ms, 3),
+                _parse_ver(staging_ver),
+                staging_preds.tolist() if staging_preds is not None else None,
+                round(staging_latency_ms, 3) if staging_latency_ms is not None else None,
+                online.hash_present,
+                online.age_s,
+                online.missing or [],
+                online.degraded or [],
+            )
+        log.debug(
+            "prediction_logged",
             city=city,
             prod_version=prod_ver,
             staging_version=staging_ver,
-            prod_mean=round(float(np.mean(prod_preds)), 4),
-            staging_mean=round(float(np.mean(staging_preds)), 4),
-            delta=round(float(np.mean(staging_preds - prod_preds)), 4),
-            n_hours=len(prod_preds),
+            prod_latency_ms=round(prod_latency_ms, 2),
         )
     except Exception as exc:
-        log.warning("shadow_score_failed", city=city, error=str(exc))
+        log.warning("prediction_log_write_failed", city=city, error=str(exc))
 
 
 # ---------------------------------------------------------------------------
