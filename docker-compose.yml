@@ -445,6 +445,7 @@ services:
     volumes:
       - prometheus_data:/prometheus
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -495,6 +496,36 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    profiles: [obs]
+    restart: unless-stopped
+    volumes:
+      - ./infra/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --log.level=info
+    ports:
+      - "127.0.0.1:9093:9093"
+    depends_on:
+      - webhook-receiver
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9093/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  webhook-receiver:
+    build:
+      context: infra/webhook-receiver
+    profiles: [obs]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9999:9999"
 
   drift:
     build:
@@ -581,3 +612,4 @@ volumes:
   clickhouse_data:
   prometheus_data:
   grafana_data:
+  alertmanager_data:

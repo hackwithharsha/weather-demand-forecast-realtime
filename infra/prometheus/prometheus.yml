@@ -2,6 +2,16 @@ global:
   scrape_interval:     15s
   evaluation_interval: 15s
 
+# Alert rules loaded from this file.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# Route firing alerts to Alertmanager.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
 scrape_configs:
   # Self-monitoring
   - job_name: prometheus
@@ -19,6 +29,7 @@ scrape_configs:
       - targets: ['ingestor:9100']
 
   # Worker — prometheus_client.start_http_server(9101)
+  # (also exports drift check metrics after the drift job was moved here)
   - job_name: worker
     static_configs:
       - targets: ['worker:9101']
@@ -33,3 +44,11 @@ scrape_configs:
     honor_labels: true
     static_configs:
       - targets: ['pushgateway:9091']
+
+  # Redpanda — consumer group lag and broker health metrics.
+  # /public_metrics exposes stable, curated metrics (redpanda_kafka_*).
+  # Used by the KafkaConsumerLagHigh alert rule.
+  - job_name: redpanda
+    metrics_path: /public_metrics
+    static_configs:
+      - targets: ['redpanda:9644']

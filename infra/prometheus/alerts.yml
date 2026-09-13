@@ -1,0 +1,78 @@
+groups:
+  - name: weather_demand_forecast
+    rules:
+
+      # ── Kafka / Redpanda consumer lag ──────────────────────────────────────
+      # Redpanda exposes per-group-topic-partition lag via /public_metrics.
+      # Fires when any consumer group falls > 1000 messages behind for 5 min.
+      - alert: KafkaConsumerLagHigh
+        expr: redpanda_kafka_consumer_group_lag > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Consumer group {{ $labels.group }} is {{ $value | humanize }}
+            messages behind on {{ $labels.topic }} (partition {{ $labels.partition }})
+          description: >-
+            The consumer group has sustained lag > 1000 for 5 minutes.
+            Check that the ingestor / worker stream consumers are running and
+            keeping up with the inbound event rate.
+
+      # ── Feature drift ──────────────────────────────────────────────────────
+      # Evidently drift score per feature, set by the worker drift job.
+      # 0.0–0.1 = negligible, 0.1–0.2 = moderate, > 0.2 = significant.
+      # Fires immediately (no `for`) because the score is already a windowed
+      # statistic — it won't bounce on a single noisy request.
+      - alert: FeatureDriftHigh
+        expr: drift_score > 0.2
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Feature {{ $labels.feature }} drift score is {{ $value | humanizePercentage }}
+          description: >-
+            Evidently drift score exceeded 0.2 (significant drift threshold).
+            The serving distribution for this feature may have diverged from
+            the training distribution logged in the Production MLflow run.
+            Check marts.drift_reports and consider re-training the model.
+
+      # ── Prediction latency ─────────────────────────────────────────────────
+      # p99 of http_request_duration_seconds for the /predict path.
+      # Uses the common-metrics histogram recorded by PrometheusMiddleware.
+      - alert: PredictionLatencyHigh
+        expr: >-
+          histogram_quantile(
+            0.99,
+            rate(http_request_duration_seconds_bucket{path="/predict"}[5m])
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            /predict p99 latency is {{ $value | humanizeDuration }} (threshold 500 ms)
+          description: >-
+            The 99th-percentile prediction latency has exceeded 500 ms for
+            5 consecutive minutes.  Check Redis feature store connectivity,
+            Postgres query performance, and API pod resource utilisation.
+
+      # ── Training freshness ─────────────────────────────────────────────────
+      # model_last_trained_timestamp is pushed to the Pushgateway after each
+      # successful training run.  Fires when the model has not been retrained
+      # in the last 48 hours, or when the metric is entirely absent (trainer
+      # has never completed a run since the Pushgateway last restarted).
+      - alert: ModelNotTrainedRecently
+        expr: >-
+          (time() - model_last_trained_timestamp > 172800)
+          or absent(model_last_trained_timestamp)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: No successful model training run in the last 48 hours
+          description: >-
+            model_last_trained_timestamp is either missing or older than 48 h.
+            Verify that the trainer job ran successfully and that the
+            Pushgateway is reachable.  Run `make train` to trigger manually.
