@@ -134,7 +134,19 @@ _state = _AppState()
 def _do_load_models(settings: Settings) -> tuple[Any, dict, Any, dict]:
     """Load Production and Staging sklearn pipelines from the MLflow registry.
 
-    Raises RuntimeError if no Production version is registered.
+    Models are always fetched by *stage URI* (``models:/<name>/Production`` and
+    ``models:/<name>/Staging``), never by run ID or version number.  This
+    guarantees the caller always gets whatever the registry currently calls
+    "Production", even if a new version was promoted since the last load.
+
+    Version metadata is obtained with ``search_model_versions`` (the
+    non-deprecated replacement for ``get_latest_versions``).  A single search
+    call retrieves all versions; they are filtered client-side by
+    ``current_stage`` and sorted descending so the highest version number wins
+    when multiple versions share the same stage.
+
+    Raises RuntimeError if no Production version is registered or if the
+    registry is unreachable — the caller is responsible for retry logic.
     Staging absence is tolerated (returns None, {}).
     """
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
@@ -148,15 +160,28 @@ def _do_load_models(settings: Settings) -> tuple[Any, dict, Any, dict]:
     client = mlflow.tracking.MlflowClient()
     model_name = settings.mlflow_registered_model_name
 
-    # Production (required)
-    prod_vs = client.get_latest_versions(model_name, stages=["Production"])
-    if not prod_vs:
-        raise RuntimeError(f"No Production model registered as {model_name!r}")
-    pv = prod_vs[0]
+    # One registry round-trip retrieves all versions; we filter client-side.
+    # max_results=1000 is generous — real deployments rarely exceed a few dozen.
+    all_vs = client.search_model_versions(
+        f"name='{model_name}'", max_results=1000
+    )
+
+    def _latest_in_stage(stage: str):
+        """Return the highest-version ModelVersion in *stage*, or None."""
+        vs = [v for v in all_vs if v.current_stage == stage]
+        return max(vs, key=lambda v: int(v.version)) if vs else None
+
+    # ── Production (required) ────────────────────────────────────────────────
+    pv = _latest_in_stage("Production")
+    if pv is None:
+        raise RuntimeError(
+            f"No Production model registered for {model_name!r}. "
+            "Run `make train` then promote a version to Production."
+        )
+    # Load by stage URI — not by version number or run ID
     prod_m = mlflow.sklearn.load_model(f"models:/{model_name}/Production")
     try:
-        run_metrics = client.get_run(pv.run_id).data.metrics
-        val_mae = run_metrics.get("val_mae")
+        val_mae = client.get_run(pv.run_id).data.metrics.get("val_mae")
     except Exception:
         val_mae = None
     prod_info: dict = {
@@ -165,25 +190,21 @@ def _do_load_models(settings: Settings) -> tuple[Any, dict, Any, dict]:
         "stage": "Production",
         "run_id": pv.run_id,
         "val_mae": round(val_mae, 6) if val_mae is not None else None,
-        "tags": {
-            k: v for k, v in pv.tags.items()
-            if not k.startswith("mlflow.")
-        },
+        "tags": {k: v for k, v in pv.tags.items() if not k.startswith("mlflow.")},
         "loaded_at": datetime.now(timezone.utc).isoformat(),
     }
     log.info("prod_model_loaded", version=pv.version, run_id=pv.run_id)
 
-    # Staging (optional)
+    # ── Staging (optional) ───────────────────────────────────────────────────
+    sv = _latest_in_stage("Staging")
     staging_m: Any = None
     staging_info: dict = {}
-    try:
-        sv_list = client.get_latest_versions(model_name, stages=["Staging"])
-        if sv_list:
-            sv = sv_list[0]
+    if sv is not None:
+        try:
+            # Load by stage URI — not by version number or run ID
             staging_m = mlflow.sklearn.load_model(f"models:/{model_name}/Staging")
             try:
-                sv_metrics = client.get_run(sv.run_id).data.metrics
-                sv_mae = sv_metrics.get("val_mae")
+                sv_mae = client.get_run(sv.run_id).data.metrics.get("val_mae")
             except Exception:
                 sv_mae = None
             staging_info = {
@@ -192,15 +213,12 @@ def _do_load_models(settings: Settings) -> tuple[Any, dict, Any, dict]:
                 "stage": "Staging",
                 "run_id": sv.run_id,
                 "val_mae": round(sv_mae, 6) if sv_mae is not None else None,
-                "tags": {
-                    k: v for k, v in sv.tags.items()
-                    if not k.startswith("mlflow.")
-                },
+                "tags": {k: v for k, v in sv.tags.items() if not k.startswith("mlflow.")},
                 "loaded_at": datetime.now(timezone.utc).isoformat(),
             }
             log.info("staging_model_loaded", version=sv.version, run_id=sv.run_id)
-    except Exception as exc:
-        log.warning("staging_model_not_loaded", error=str(exc))
+        except Exception as exc:
+            log.warning("staging_model_not_loaded", error=str(exc))
 
     return prod_m, prod_info, staging_m, staging_info
 
@@ -219,14 +237,28 @@ async def _load_models_async(settings: Settings) -> None:
 
 
 async def _model_load_retry_loop(settings: Settings, interval_s: int = 30) -> None:
-    """Retry model loading in the background until it succeeds."""
-    while _state.prod_model is None:
+    """Retry model loading every *interval_s* seconds until it succeeds.
+
+    The loop runs until the task is cancelled (shutdown) or a load attempt
+    completes without raising.  It does not exit early based on the current
+    value of ``_state.prod_model`` — that avoids a race where a concurrent
+    ``/admin/reload`` sets the model between the sleep and the attempt.
+    """
+    attempt = 0
+    while True:
         await asyncio.sleep(interval_s)
+        attempt += 1
         try:
             await _load_models_async(settings)
-            log.info("model_load_retry_succeeded")
+            log.info("model_load_retry_succeeded", attempts=attempt)
+            return          # success — exit the loop
         except Exception as exc:
-            log.warning("model_load_retry_failed", error=str(exc))
+            log.warning(
+                "model_load_retry_failed",
+                attempt=attempt,
+                retry_in_s=interval_s,
+                error=str(exc),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -299,12 +331,23 @@ async def lifespan(app: FastAPI):
         log.warning("postgres_pool_failed", error=str(exc))
         _state.pg = None
 
-    # Model loading — best-effort; retry in background on failure
+    # Model loading — best-effort at startup.
+    # Two distinct failure modes are handled identically here:
+    #   • MLflow/MinIO unreachable (network, wrong profile, not yet up)
+    #   • Registry has no Production version yet (need `make train` first)
+    # In both cases the API starts, /health returns 200, /ready returns 503,
+    # and a background task retries every 30 s until it succeeds.
+    # Once MLflow is reachable (or after `make train`), call `make reload`
+    # or wait for the retry loop to pick it up automatically.
     try:
         await _load_models_async(s)
     except Exception as exc:
-        log.warning("model_load_startup_failed", error=str(exc),
-                    hint="call POST /admin/reload once MLflow is reachable")
+        log.warning(
+            "model_load_startup_failed",
+            error=str(exc),
+            ready_probe="503 until models loaded",
+            recovery="background retry every 30 s; or POST /admin/reload",
+        )
         _state.retry_task = asyncio.create_task(_model_load_retry_loop(s))
 
     # Background broadcast
