@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     training_lookback_days: int = 30   # calendar days of mart history to load
     val_days: int = 7                  # last N days withheld as time-based holdout
 
+    # Promotion gates
+    # PSI (Population Stability Index) threshold for feature drift.
+    # PSI < 0.1 = negligible drift; 0.1–0.2 = moderate; > 0.2 = significant.
+    # Default 0.25 gives headroom for normal temporal drift in a time-series
+    # setting while still blocking catastrophic distribution shifts.
+    feature_drift_threshold: float = 0.25
+
     # Reproducibility controls
     # random_seed is passed to every stochastic estimator (currently HGB).
     # Running with the same data + same seed must produce bit-for-bit identical

@@ -91,6 +91,7 @@ class TrainResult:
     val_rmse: float
     val_mape: float
     pipeline: Pipeline           # fitted sklearn Pipeline (preprocessor + model)
+    X_train: pd.DataFrame        # training features — for drift check in promote.py
     X_val: pd.DataFrame          # raw holdout features — for re-evaluating Production
     y_val: pd.Series             # holdout targets
     split_date: datetime         # first timestamp in the validation set
@@ -328,6 +329,7 @@ def _train_one(
             val_rmse=val_rmse,
             val_mape=val_mape,
             pipeline=pipeline,
+            X_train=X_train[FEATURE_COLS].copy(),
             X_val=X_val[FEATURE_COLS].copy(),
             y_val=y_val.copy(),
             split_date=shared_params["split_date_dt"],
