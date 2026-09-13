@@ -120,8 +120,12 @@ test-common: ## Run libs/common unit tests (pure Python, no services needed)
 		python:3.12-slim \
 		sh -c "pip install -q uv && uv pip install --system -q '.[test]' && python -m pytest tests/ -v"
 
+.PHONY: test-trainer
+test-trainer: ## Run trainer unit tests (no live services needed)
+	$(COMPOSE) run --no-deps --rm trainer pytest tests/ -v
+
 .PHONY: test
-test: test-common ## Run all tests
+test: test-common test-trainer ## Run all tests
 
 .PHONY: test-%
 test-%: ## Run tests for a compose service  (e.g. make test-api)
@@ -297,6 +301,7 @@ worker-pipeline: ## Run the batch pipeline once now (raw → staging → marts �
 # ---------------------------------------------------------------------------
 .PHONY: train
 train: ## Train Ridge + HGB, log to MLflow, register and promote best model
+	GIT_SHA=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown) \
 	$(COMPOSE) $(P_CORE) $(P_ML) run --rm trainer
 
 # ---------------------------------------------------------------------------

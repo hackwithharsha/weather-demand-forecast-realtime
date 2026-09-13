@@ -18,6 +18,17 @@ class Settings(BaseSettings):
     training_lookback_days: int = 30   # calendar days of mart history to load
     val_days: int = 7                  # last N days withheld as time-based holdout
 
+    # Reproducibility controls
+    # random_seed is passed to every stochastic estimator (currently HGB).
+    # Running with the same data + same seed must produce bit-for-bit identical
+    # metrics across runs.
+    random_seed: int = 42
+
+    # Populated from the GIT_SHA env var, which the Makefile injects at
+    # train-time via `git rev-parse --short HEAD`.  Logged as an MLflow param
+    # so every run is traceable back to a source commit.
+    git_sha: str = "unknown"
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
     @property

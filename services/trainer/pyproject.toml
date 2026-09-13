@@ -23,6 +23,10 @@ test = ["pytest>=8.0"]
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+cache_dir = "/tmp/pytest-trainer-cache"
+
 [tool.ruff]
 line-length = 88
 

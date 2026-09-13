@@ -407,6 +407,9 @@ services:
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       TRAINING_LOOKBACK_DAYS: ${TRAINING_LOOKBACK_DAYS:-30}
       VAL_DAYS:              ${TRAINER_VAL_DAYS:-7}
+      RANDOM_SEED:           ${RANDOM_SEED:-42}
+      GIT_SHA:               ${GIT_SHA:-unknown}
+      GIT_PYTHON_REFRESH:    quiet
     depends_on:
       postgres:
         condition: service_healthy

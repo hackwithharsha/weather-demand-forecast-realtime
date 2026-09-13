@@ -50,7 +50,9 @@ registered model without re-applying any separate preprocessing step.
 
 from __future__ import annotations
 
+import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -175,8 +177,13 @@ def _naive_baseline_run(
 # Model pipeline factories
 # ---------------------------------------------------------------------------
 
-def _ridge_pipeline() -> Pipeline:
-    """Ridge regression with imputation + standardisation."""
+def _ridge_pipeline(seed: int) -> Pipeline:  # noqa: ARG001  (seed unused; uniform interface)
+    """Ridge regression with imputation + standardisation.
+
+    Ridge is analytically deterministic regardless of seed, but the parameter
+    is accepted so every factory in ``_PIPELINE_FACTORIES`` has the same
+    signature.
+    """
     numeric_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler",  StandardScaler()),
@@ -191,7 +198,7 @@ def _ridge_pipeline() -> Pipeline:
     return Pipeline([("prep", preprocessor), ("model", Ridge(alpha=1.0))])
 
 
-def _hgb_pipeline() -> Pipeline:
+def _hgb_pipeline(seed: int) -> Pipeline:
     """HistGradientBoosting — handles NaN natively via surrogate splits."""
     preprocessor = ColumnTransformer(
         transformers=[
@@ -211,12 +218,12 @@ def _hgb_pipeline() -> Pipeline:
             learning_rate=0.05,
             max_leaf_nodes=31,
             min_samples_leaf=20,
-            random_state=42,
+            random_state=seed,
         )),
     ])
 
 
-_PIPELINE_FACTORIES: dict[str, Any] = {
+_PIPELINE_FACTORIES: dict[str, Callable[[int], Pipeline]] = {
     "Ridge": _ridge_pipeline,
     "HistGradientBoosting": _hgb_pipeline,
 }
@@ -354,6 +361,9 @@ def run_training(df: pd.DataFrame, settings: Settings) -> TrainResult:
         )
 
     data_hash = snapshot_hash(df)
+    feature_list_hash = hashlib.sha256(
+        json.dumps(FEATURE_COLS).encode()
+    ).hexdigest()[:16]
 
     shared_params: dict[str, Any] = {
         "lookback_days":        settings.training_lookback_days,
@@ -364,6 +374,10 @@ def run_training(df: pd.DataFrame, settings: Settings) -> TrainResult:
         "split_date_dt":        split_date_dt,     # removed before log_params
         "data_snapshot_hash":   data_hash,
         "num_cities":           int(df["city"].nunique()),
+        # --- reproducibility fingerprint ---
+        "random_seed":          settings.random_seed,
+        "git_sha":              settings.git_sha,
+        "feature_list_hash":    feature_list_hash,
     }
 
     log.info(
@@ -391,7 +405,7 @@ def run_training(df: pd.DataFrame, settings: Settings) -> TrainResult:
     for model_type, factory in _PIPELINE_FACTORIES.items():
         result = _train_one(
             model_type,
-            factory(),
+            factory(settings.random_seed),
             X_train, y_train,
             X_val,   y_val,
             {**loggable_shared, "split_date_dt": split_date_dt},
