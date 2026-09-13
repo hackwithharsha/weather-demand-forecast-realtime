@@ -1,0 +1,385 @@
+{
+  "id": null,
+  "uid": "data-quality",
+  "title": "Data Quality",
+  "tags": ["demand-forecast", "quality", "drift"],
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "5m",
+  "time": {"from": "now-24h", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Features Currently Drifting",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 1},
+              {"color": "red", "value": 3}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "orientation": "auto", "textMode": "auto", "colorMode": "background",
+        "graphMode": "none", "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum(drift_detected)",
+          "legendFormat": "drifting",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Last Drift Check",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeAsIso",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "orientation": "auto", "textMode": "auto", "colorMode": "value",
+        "graphMode": "none", "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "drift_job_last_run_timestamp * 1000",
+          "legendFormat": "last check",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Drift Check Duration (s)",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 30},
+              {"color": "red", "value": 60}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "orientation": "auto", "textMode": "auto", "colorMode": "value",
+        "graphMode": "none", "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "drift_job_duration_seconds",
+          "legendFormat": "duration",
+          "instant": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Reference / Current Sample Size",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 20},
+              {"color": "green", "value": 100}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "orientation": "auto", "textMode": "auto", "colorMode": "value",
+        "graphMode": "none", "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "drift_job_reference_count",
+          "legendFormat": "reference rows",
+          "instant": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "drift_job_current_count",
+          "legendFormat": "current rows",
+          "instant": true,
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Drift Score by Feature",
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4,
+          "min": 0,
+          "max": 1,
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 1, "fillOpacity": 5, "spanNulls": true}
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "right", "calcs": []}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "drift_score",
+          "legendFormat": "{{feature}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Drift Detected by Feature (1 = drifting, 0 = ok)",
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 20, "spanNulls": true}
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "right", "calcs": []}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "drift_detected",
+          "legendFormat": "{{feature}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Validation Rejects / s",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "fixed", "fixedColor": "red"},
+          "custom": {"lineWidth": 1, "fillOpacity": 15, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {"mode": "single"},
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": []}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(worker_pipeline_validation_rejects_total[5m])",
+          "legendFormat": "rejects/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "DLQ Rate / s by Topic",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 1, "fillOpacity": 15, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": []}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(ingestor_messages_dlq_total[5m])",
+          "legendFormat": "{{topic}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Validation Failures by Topic / s",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 1, "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": []}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(ingestor_messages_validation_failed_total[5m])",
+          "legendFormat": "{{topic}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Batch Write Duration p90 by Topic (s)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 1, "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {"mode": "multi", "sort": "desc"},
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": []}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.90, rate(ingestor_batch_write_duration_seconds_bucket[5m]))",
+          "legendFormat": "{{topic}} p90",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Latest Drift Report (Postgres)",
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 30},
+      "datasource": {"type": "postgres", "uid": "postgres"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {
+            "align": "left",
+            "cellOptions": {"type": "auto"},
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Score"},
+            "properties": [
+              {"id": "unit", "value": "short"},
+              {"id": "decimals", "value": 4},
+              {"id": "custom.width", "value": 80}
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "Drifting"},
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {"type": "color-text"}
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "red", "value": "YES"}
+                  ]
+                }
+              },
+              {"id": "custom.width", "value": 80}
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {"show": false, "reducer": ["sum"], "enablePagination": false}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "rawQuery": true,
+          "rawSql": "SELECT\n  feature_name AS \"Feature\",\n  round(drift_score::numeric, 4) AS \"Score\",\n  CASE WHEN drift_detected THEN 'YES' ELSE 'no' END AS \"Drifting\",\n  stat_test AS \"Test\",\n  round(p_value::numeric, 4) AS \"P-Value\",\n  reference_count AS \"Ref Rows\",\n  current_count AS \"Curr Rows\",\n  to_char(checked_at, 'YYYY-MM-DD HH24:MI:SS') AS \"Checked At\"\nFROM marts.drift_reports\nWHERE checked_at = (SELECT max(checked_at) FROM marts.drift_reports)\nORDER BY drift_score DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
