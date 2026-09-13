@@ -14,13 +14,14 @@ WORKDIR /app
 COPY libs/common ./libs/common
 RUN uv pip install --system --no-cache ./libs/common
 
-# Layer 2 — service deps
+# Layer 2 — service deps (including optional test extras)
 COPY services/api/pyproject.toml .
 RUN mkdir -p app && touch app/__init__.py \
-    && uv pip install --system --no-cache .
+    && uv pip install --system --no-cache ".[test]"
 
-# Layer 3 — source
-COPY services/api/app/ ./app/
+# Layer 3 — source + tests
+COPY services/api/app/    ./app/
+COPY services/api/tests/  ./tests/
 
 USER app
 

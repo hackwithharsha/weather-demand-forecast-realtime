@@ -23,7 +23,7 @@ help: ## List available targets
 # Start
 # ---------------------------------------------------------------------------
 .PHONY: up
-up: ## Start core services (postgres, redis)
+up: ## Start core services (postgres, redis, minio, api)
 	$(COMPOSE) $(P_CORE) up -d
 
 .PHONY: up-stream
@@ -295,6 +295,13 @@ reconstruct: ## Reconstruct stream features from Parquet lake  (ROUTE=london AT=
 .PHONY: worker-pipeline
 worker-pipeline: ## Run the batch pipeline once now (raw → staging → marts → scaler)
 	$(COMPOSE) $(P_CORE) $(P_STREAM) run --rm worker python -m app.pipeline
+
+# ---------------------------------------------------------------------------
+# API reload
+# ---------------------------------------------------------------------------
+.PHONY: reload
+reload: ## Hot-swap Production + Staging models without restarting the API
+	curl -sf -X POST http://localhost:8080/admin/reload | python3 -m json.tool
 
 # ---------------------------------------------------------------------------
 # ML training
