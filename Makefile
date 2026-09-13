@@ -39,8 +39,8 @@ up-obs: ## Start observability services (prometheus, grafana)
 	$(COMPOSE) $(P_OBS) up -d
 
 .PHONY: up-ui
-up-ui: ## Start application services (api, ingestion, forecaster, frontend)
-	$(COMPOSE) $(P_UI) up -d
+up-ui: ## Start core + application services (api, ingestion, forecaster, frontend)
+	$(COMPOSE) $(P_CORE) $(P_UI) up -d
 
 .PHONY: up-all
 up-all: ## Start all services

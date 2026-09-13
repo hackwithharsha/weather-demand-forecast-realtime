@@ -380,12 +380,31 @@ services:
 
   # ---------------------------------------------------------------------------
   # ui  –  api, ingestion, forecaster, frontend
-  # TODO: define when application services are implemented
   # ---------------------------------------------------------------------------
 
-  # api:
-  #   build: ./services/api
-  #   profiles: [ui]
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    profiles: [ui]
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST:     redis
+      REDIS_PORT:     6379
+      REDIS_DB:       0
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    ports:
+      - "127.0.0.1:8080:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   # ingestion:
   #   build: ./services/ingestion
