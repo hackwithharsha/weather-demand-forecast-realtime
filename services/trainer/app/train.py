@@ -52,6 +52,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -310,6 +312,14 @@ def _train_one(
 
         # ── Log feature list as standalone artifact ───────────────────────
         mlflow.log_text(json.dumps(FEATURE_COLS, indent=2), "feature_list.json")
+
+        # ── Log training features as reference dataset for drift detection ─
+        # The worker's drift job downloads this artifact from the Production
+        # model's run to use as the Evidently reference distribution.
+        with tempfile.TemporaryDirectory() as tmp:
+            ref_path = os.path.join(tmp, "reference_data.parquet")
+            X_train[FEATURE_COLS].to_parquet(ref_path, index=False)
+            mlflow.log_artifact(ref_path, artifact_path="reference")
 
         log.info(
             "model_trained",

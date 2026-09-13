@@ -59,6 +59,20 @@ class Settings(BaseSettings):
     feature_store_cron_hour:   int = 2
     feature_store_cron_minute: int = 30
 
+    # MLflow (drift job — reference dataset from the Production model run)
+    mlflow_tracking_uri:           str = "http://mlflow:5000"
+    mlflow_registered_model_name:  str = "demand-forecaster"
+    mlflow_s3_endpoint_url:        str = "http://minio:9000"
+    # Use MINIO_SVC_ACCESS_KEY / MINIO_SVC_SECRET_KEY (same creds as the
+    # MLflow server) so the worker can read from the s3://mlflow/ bucket.
+    mlflow_s3_access_key: str = Field(default="minioadmin", alias="MINIO_SVC_ACCESS_KEY")
+    mlflow_s3_secret_key: str = Field(default="minioadmin", alias="MINIO_SVC_SECRET_KEY")
+
+    # Drift check schedule
+    drift_check_interval_minutes: int = 60   # how often to run Evidently
+    drift_current_hours:          int = 24   # hours of prediction_features as current window
+    drift_min_current_rows:       int = 20   # skip if fewer rows than this
+
     @property
     def postgres_dsn(self) -> str:
         return (

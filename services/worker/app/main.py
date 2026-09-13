@@ -52,6 +52,7 @@ from apscheduler.triggers.cron import CronTrigger
 from common.log import configure_logging
 from common.metrics import start_metrics_server
 
+from .drift import run_drift_check
 from .feature_store import run_feature_store
 from .pipeline import run_pipeline
 from .settings import Settings
@@ -111,6 +112,16 @@ def main() -> None:
         id="feature_store_sync",
         name="route mart → Redis feature store",
         misfire_grace_time=600,
+        coalesce=True,
+    )
+
+    scheduler.add_job(
+        run_drift_check,
+        "interval",
+        minutes=settings.drift_check_interval_minutes,
+        args=[settings],
+        id="drift_check",
+        name=f"Evidently drift check (every {settings.drift_check_interval_minutes} min)",
         coalesce=True,
     )
 
