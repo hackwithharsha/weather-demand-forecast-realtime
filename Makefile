@@ -35,8 +35,8 @@ up-ml: ## Start core + ML services (mlflow, clickhouse)
 	$(COMPOSE) $(P_CORE) $(P_ML) up -d
 
 .PHONY: up-obs
-up-obs: ## Start observability services (prometheus, grafana)
-	$(COMPOSE) $(P_OBS) up -d
+up-obs: ## Start core + observability services (prometheus, grafana, pushgateway, drift)
+	$(COMPOSE) $(P_CORE) $(P_OBS) up -d
 
 .PHONY: up-ui
 up-ui: ## Start core + application services (api, ingestion, forecaster, frontend)

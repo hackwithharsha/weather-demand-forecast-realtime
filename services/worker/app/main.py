@@ -50,6 +50,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from common.log import configure_logging
+from common.metrics import start_metrics_server
 
 from .feature_store import run_feature_store
 from .pipeline import run_pipeline
@@ -62,6 +63,8 @@ log = structlog.get_logger()
 def main() -> None:
     settings = Settings()
     configure_logging(settings.log_level)
+
+    start_metrics_server(9101)
 
     # Shared stop signal for the stream consumer threads.
     stop_event = threading.Event()

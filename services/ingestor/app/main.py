@@ -15,6 +15,7 @@ import threading
 import structlog
 
 from common.log import configure_logging
+from common.metrics import start_metrics_server
 
 from .consumers import (
     _make_dlq_producer,
@@ -30,6 +31,8 @@ log = structlog.get_logger()
 def main() -> None:
     settings = Settings()
     configure_logging(settings.log_level)
+
+    start_metrics_server(9100)
 
     stop_event = threading.Event()
 

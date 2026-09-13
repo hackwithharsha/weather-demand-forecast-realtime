@@ -70,7 +70,7 @@ def _holidays_for(city: str, year: int) -> frozenset[date]:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_marts(settings: Settings) -> None:
+def run_marts(settings: Settings) -> int:
     """
     Populate marts.city_hour_features from staging, apply holiday flags,
     then assert quality.  Raises RuntimeError (listing all failures) if any
@@ -96,7 +96,7 @@ def run_marts(settings: Settings) -> None:
 
     if rows_upserted == 0:
         log.warning("marts_no_rows_upserted", reason="staging.demand_hourly is empty")
-        return
+        return 0
 
     # ── Step 2: holiday flags (Python; SQL cannot do this) ────────────────
     log.info("marts_holidays_started")
@@ -119,6 +119,7 @@ def run_marts(settings: Settings) -> None:
         conn.close()
 
     log.info("marts_done", rows=rows_upserted)
+    return rows_upserted
 
 
 # ---------------------------------------------------------------------------

@@ -53,6 +53,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -67,6 +68,9 @@ import structlog
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from common.metrics import PrometheusMiddleware, mount_metrics
+
+from . import metrics as _met
 from .features.online import (
     ONLINE_FEATURES,
     OnlineResult,
@@ -378,6 +382,10 @@ app = FastAPI(
 )
 
 
+app.add_middleware(PrometheusMiddleware)
+mount_metrics(app)
+
+
 # ---------------------------------------------------------------------------
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
@@ -517,11 +525,14 @@ async def _do_predict(city: str, horizon_hours: int) -> dict:
         if val is not None:
             base[col] = val
 
-    # Maintain hash-level hit/miss counters for the /model/info summary.
+    # Maintain hash-level hit/miss counters for the /model/info summary
+    # and update Prometheus counters.
     if online.hash_present:
         _state.redis_hits += 1
+        _met.feature_cache_hits_total.inc()
     else:
         _state.redis_misses += 1
+        _met.feature_cache_misses_total.inc()
 
     total = _state.redis_hits + _state.redis_misses
     if total > 0 and total % 200 == 0:
@@ -551,6 +562,7 @@ async def _do_predict(city: str, horizon_hours: int) -> dict:
     )
     prod_latency_ms = (loop.time() - _t0) * 1000
     prod_ver = str(_state.prod_info.get("version", "unknown"))
+    _met.predictions_total.labels(city=city, model_version=prod_ver).inc()
 
     # 5. Shadow-score Staging + persist both to prediction_log (fire-and-forget).
     #    Always fires regardless of whether Staging is loaded so that Production
@@ -616,6 +628,8 @@ async def _shadow_task(
             staging_preds = await loop.run_in_executor(None, staging_m.predict, df)
             staging_latency_ms = (loop.time() - _t0) * 1000
             staging_ver = str(_state.staging_info.get("version", "unknown"))
+            abs_delta = float(np.mean(np.abs(staging_preds - prod_preds)))
+            _met.shadow_delta_absolute.labels(city=city).observe(abs_delta)
             log.info(
                 "shadow_score",
                 city=city,

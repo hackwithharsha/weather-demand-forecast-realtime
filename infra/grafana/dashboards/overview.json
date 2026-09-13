@@ -1,0 +1,361 @@
+{
+  "id": null,
+  "uid": "demand-forecast-overview",
+  "title": "Demand Forecast — Overview",
+  "tags": ["demand-forecast"],
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": {"h": 2, "w": 24, "x": 0, "y": 0},
+      "options": {
+        "mode": "markdown",
+        "content": "## API Service"
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "HTTP Request Rate (req/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 2},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "reqps", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "options": {"tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (path) (rate(http_requests_total{job=\"api\"}[2m]))",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "HTTP Latency — P50 / P99 (s)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 2},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "s", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.50, sum by (path, le) (rate(http_request_duration_seconds_bucket{job=\"api\"}[2m])))",
+          "legendFormat": "p50 {{path}}"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.99, sum by (path, le) (rate(http_request_duration_seconds_bucket{job=\"api\"}[2m])))",
+          "legendFormat": "p99 {{path}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Predictions / min (by city & model version)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (city, model_version) (rate(predictions_total{job=\"api\"}[2m]) * 60)",
+          "legendFormat": "{{city}} v{{model_version}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Feature Cache Hit Rate",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.7},
+              {"color": "green", "value": 0.9}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(feature_cache_hits_total{job=\"api\"}[5m]) / (rate(feature_cache_hits_total{job=\"api\"}[5m]) + rate(feature_cache_misses_total{job=\"api\"}[5m]) + 1e-9)",
+          "legendFormat": "Hit Rate"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Shadow Delta (|staging − prod| mean, p50 by city)",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 10},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.5, sum by (city, le) (rate(shadow_delta_absolute_bucket{job=\"api\"}[10m])))",
+          "legendFormat": "p50 {{city}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "text",
+      "title": "",
+      "gridPos": {"h": 2, "w": 24, "x": 0, "y": 18},
+      "options": {
+        "mode": "markdown",
+        "content": "## Ingestor"
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Messages Consumed / min",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (topic) (rate(ingestor_messages_consumed_total[2m]) * 60)",
+          "legendFormat": "{{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "DLQ Messages / min",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (topic) (rate(ingestor_messages_dlq_total[2m]) * 60)",
+          "legendFormat": "DLQ {{topic}}"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (topic) (rate(ingestor_messages_validation_failed_total[2m]) * 60)",
+          "legendFormat": "Validation fail {{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Batch Write Duration p90 (s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "s", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.9, sum by (topic, le) (rate(ingestor_batch_write_duration_seconds_bucket[5m])))",
+          "legendFormat": "p90 {{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "text",
+      "title": "",
+      "gridPos": {"h": 2, "w": 24, "x": 0, "y": 36},
+      "options": {
+        "mode": "markdown",
+        "content": "## Worker (Batch Pipeline)"
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Pipeline Stage Duration p90 (s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 38},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "s", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.9, sum by (stage, le) (rate(worker_pipeline_run_duration_seconds_bucket[10m])))",
+          "legendFormat": "p90 {{stage}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Pipeline Runs (cumulative)",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 38},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (status) (worker_pipeline_runs_total)",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Last Successful Pipeline Run",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 38},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "dateTimeAsIso", "color": {"mode": "thresholds"}},
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "worker_pipeline_last_run_timestamp * 1000",
+          "legendFormat": "Last Run"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Pipeline Rows Processed",
+      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 42},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (stage) (rate(worker_pipeline_rows_processed_total[10m]) * 60)",
+          "legendFormat": "{{stage}} rows/min"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "text",
+      "title": "",
+      "gridPos": {"h": 2, "w": 24, "x": 0, "y": 46},
+      "options": {
+        "mode": "markdown",
+        "content": "## Trainer (Pushgateway)"
+      }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Model Val MAE (last training)",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 48},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "decimals": 4, "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "model_val_mae",
+          "legendFormat": "{{model_type}}"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Model Val RMSE (last training)",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 48},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "decimals": 4, "color": {"mode": "palette-classic"}},
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "model_val_rmse",
+          "legendFormat": "{{model_type}}"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "Last Model Training",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 48},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"unit": "dateTimeAsIso", "color": {"mode": "thresholds"}},
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "model_last_trained_timestamp * 1000",
+          "legendFormat": "Trained At"
+        }
+      ]
+    }
+  ],
+  "time": {"from": "now-3h", "to": "now"},
+  "timepicker": {}
+}

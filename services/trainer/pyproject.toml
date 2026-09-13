@@ -12,6 +12,7 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.26",
     "scikit-learn>=1.5",
+    "prometheus-client>=0.20",
     "pydantic-settings>=2.5",
     "structlog>=24.4",
     "boto3>=1.34",        # MLflow artifact store (MinIO)

@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # so every run is traceable back to a source commit.
     git_sha: str = "unknown"
 
+    # Prometheus Pushgateway URL.  Empty string disables the push.
+    # Set to http://pushgateway:9091 when the obs profile is running.
+    pushgateway_url: str = ""
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
     @property

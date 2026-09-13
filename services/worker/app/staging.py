@@ -49,7 +49,7 @@ def _floor_hour(dt: datetime) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0)
 
 
-def run_staging(settings: Settings) -> None:
+def run_staging(settings: Settings) -> tuple[int, int]:
     """
     Execute sql/staging/001_demand.sql and sql/staging/002_weather.sql
     for the configured ``training_lookback_days`` window.
@@ -92,3 +92,4 @@ def run_staging(settings: Settings) -> None:
         total_rejects=total_rejects,
         total_staging_upserts=total_staging,
     )
+    return total_staging, total_rejects

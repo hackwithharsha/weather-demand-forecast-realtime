@@ -30,6 +30,8 @@ or inside the container:
 
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 import psycopg2
 import structlog
@@ -39,6 +41,13 @@ from common.s3 import make_s3_client
 
 from .features.pipeline import ALL_FEATURE_COLS, fit_pipeline, save_pipeline
 from .marts import run_marts
+from .metrics import (
+    pipeline_last_run_timestamp,
+    pipeline_rows_processed_total,
+    pipeline_run_duration_seconds,
+    pipeline_runs_total,
+    pipeline_validation_rejects_total,
+)
 from .settings import Settings
 from .staging import run_staging
 
@@ -53,12 +62,29 @@ def run_pipeline(settings: Settings) -> None:
     exception is caught by the scheduler so subsequent jobs still fire.
     """
     log.info("pipeline_run_started")
+    t_total = time.monotonic()
     try:
-        run_staging(settings)
-        run_marts(settings)
+        t0 = time.monotonic()
+        staging_rows, staging_rejects = run_staging(settings)
+        pipeline_run_duration_seconds.labels(stage="staging").observe(time.monotonic() - t0)
+        pipeline_rows_processed_total.labels(stage="staging").inc(staging_rows)
+        pipeline_validation_rejects_total.inc(staging_rejects)
+
+        t0 = time.monotonic()
+        marts_rows = run_marts(settings)
+        pipeline_run_duration_seconds.labels(stage="marts").observe(time.monotonic() - t0)
+        pipeline_rows_processed_total.labels(stage="marts").inc(marts_rows)
+
+        t0 = time.monotonic()
         _maybe_fit_features_pipeline(settings)
+        pipeline_run_duration_seconds.labels(stage="scaler").observe(time.monotonic() - t0)
+
+        pipeline_run_duration_seconds.labels(stage="total").observe(time.monotonic() - t_total)
+        pipeline_last_run_timestamp.set_to_current_time()
+        pipeline_runs_total.labels(status="success").inc()
         log.info("pipeline_run_completed")
     except Exception:
+        pipeline_runs_total.labels(status="failure").inc()
         log.exception("pipeline_run_failed")
         raise
 

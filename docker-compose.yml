@@ -427,6 +427,7 @@ services:
       RANDOM_SEED:           ${RANDOM_SEED:-42}
       GIT_SHA:               ${GIT_SHA:-unknown}
       GIT_PYTHON_REFRESH:    quiet
+      PUSHGATEWAY_URL:       ${PUSHGATEWAY_URL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -434,17 +435,83 @@ services:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
-  # obs  –  prometheus, grafana
-  # TODO: define when observability layer is implemented
+  # obs  –  prometheus, grafana, pushgateway, drift
   # ---------------------------------------------------------------------------
 
-  # prometheus:
-  #   image: prom/prometheus:latest
-  #   profiles: [obs]
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    profiles: [obs]
+    restart: unless-stopped
+    volumes:
+      - prometheus_data:/prometheus
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
-  # grafana:
-  #   image: grafana/grafana:latest
-  #   profiles: [obs]
+  grafana:
+    image: grafana/grafana:10.4.2
+    profiles: [obs]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_HTTP_PORT: 3000
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  pushgateway:
+    image: prom/pushgateway:v1.8.0
+    profiles: [obs]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9091:9091"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9091/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  drift:
+    build:
+      context: services/drift
+    profiles: [obs]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB:-forecast}
+      POSTGRES_USER:     ${POSTGRES_USER:-forecast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      METRICS_PORT:      8000
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # ---------------------------------------------------------------------------
   # core (continued)  –  forecast serving API
@@ -512,3 +579,5 @@ volumes:
   redpanda_data:
   minio_data:
   clickhouse_data:
+  prometheus_data:
+  grafana_data:

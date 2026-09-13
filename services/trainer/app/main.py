@@ -30,6 +30,7 @@ The only required secret is POSTGRES_PASSWORD.
 from __future__ import annotations
 
 import sys
+import time as _time
 
 import mlflow
 import structlog
@@ -84,6 +85,24 @@ def main() -> None:
 
     # ── Register + conditionally promote ─────────────────────────────────────
     register_and_maybe_promote(best, settings)
+
+    # ── Push metrics to Prometheus Pushgateway (best-effort) ──────────────────
+    if settings.pushgateway_url:
+        try:
+            from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+            registry = CollectorRegistry()
+            g_ts   = Gauge("model_last_trained_timestamp", "Unix timestamp of last training run", registry=registry)
+            g_mae  = Gauge("model_val_mae",  "Validation MAE",  ["model_type"], registry=registry)
+            g_rmse = Gauge("model_val_rmse", "Validation RMSE", ["model_type"], registry=registry)
+            g_mape = Gauge("model_val_mape", "Validation MAPE", ["model_type"], registry=registry)
+            g_ts.set(_time.time())
+            g_mae.labels(model_type=best.model_type).set(best.val_mae)
+            g_rmse.labels(model_type=best.model_type).set(best.val_rmse)
+            g_mape.labels(model_type=best.model_type).set(best.val_mape)
+            push_to_gateway(settings.pushgateway_url, job="trainer", registry=registry)
+            log.info("trainer_metrics_pushed", pushgateway_url=settings.pushgateway_url)
+        except Exception as exc:
+            log.warning("trainer_metrics_push_failed", error=str(exc))
 
     log.info(
         "trainer_finished",

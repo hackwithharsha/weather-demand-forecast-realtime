@@ -35,6 +35,13 @@ from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, Topi
 from common.producer import EventProducer
 
 from .db import _Buffered, batch_insert_demand_events, batch_insert_weather_readings, connect
+from .metrics import (
+    batch_write_duration_seconds,
+    batch_write_rows_total,
+    messages_consumed_total,
+    messages_dlq_total,
+    messages_validation_failed_total,
+)
 from .settings import Settings
 
 log = structlog.get_logger()
@@ -144,8 +151,12 @@ def _flush_demand_batch(
     pending_offsets: dict[int, int],
 ) -> None:
     if batch:
+        t0 = time.monotonic()
         try:
             batch_insert_demand_events(conn, batch)
+            elapsed = time.monotonic() - t0
+            batch_write_duration_seconds.labels(topic="demand").observe(elapsed)
+            batch_write_rows_total.labels(topic="demand").inc(len(batch))
             log.info("demand_batch_flushed", count=len(batch))
         except psycopg2.Error as exc:
             try:
@@ -157,6 +168,7 @@ def _flush_demand_batch(
                 _send_to_dlq(
                     dlq_producer, settings.dlq_topic, item.key, item.raw_value, str(exc)
                 )
+                messages_dlq_total.labels(topic="demand").inc()
     _commit_offsets(consumer, settings.demand_topic, pending_offsets)
 
 
@@ -198,6 +210,7 @@ def demand_consumer_loop(
                             event_id=event_id,
                             payload=payload,
                         ))
+                        messages_consumed_total.labels(topic="demand").inc()
                         log.debug(
                             "demand_buffered",
                             city=payload.get("city"),
@@ -207,6 +220,8 @@ def demand_consumer_loop(
                             partition=msg.partition(),
                         )
                     except (json.JSONDecodeError, KeyError, ValidationError) as exc:
+                        messages_validation_failed_total.labels(topic="demand").inc()
+                        messages_dlq_total.labels(topic="demand").inc()
                         log.warning(
                             "demand_validation_failed",
                             offset=msg.offset(),
@@ -261,8 +276,12 @@ def _flush_weather_batch(
     pending_offsets: dict[int, int],
 ) -> None:
     if batch:
+        t0 = time.monotonic()
         try:
             batch_insert_weather_readings(conn, batch)
+            elapsed = time.monotonic() - t0
+            batch_write_duration_seconds.labels(topic="weather").observe(elapsed)
+            batch_write_rows_total.labels(topic="weather").inc(len(batch))
             log.info("weather_batch_flushed", count=len(batch))
         except psycopg2.Error as exc:
             try:
@@ -274,6 +293,7 @@ def _flush_weather_batch(
                 _send_to_dlq(
                     dlq_producer, settings.dlq_topic, item.key, item.raw_value, str(exc)
                 )
+                messages_dlq_total.labels(topic="weather").inc()
     _commit_offsets(consumer, settings.weather_topic, pending_offsets)
 
 
@@ -315,6 +335,7 @@ def weather_consumer_loop(
                             event_id=event_id,
                             payload=payload,
                         ))
+                        messages_consumed_total.labels(topic="weather").inc()
                         log.debug(
                             "weather_buffered",
                             city=payload.get("city"),
@@ -323,6 +344,8 @@ def weather_consumer_loop(
                             partition=msg.partition(),
                         )
                     except (json.JSONDecodeError, KeyError, ValidationError) as exc:
+                        messages_validation_failed_total.labels(topic="weather").inc()
+                        messages_dlq_total.labels(topic="weather").inc()
                         log.warning(
                             "weather_validation_failed",
                             offset=msg.offset(),
