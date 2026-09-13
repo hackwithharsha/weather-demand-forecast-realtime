@@ -31,8 +31,8 @@ up-stream: ## Start core + streaming services (redpanda, producers, ingestor, wo
 	$(COMPOSE) $(P_CORE) $(P_STREAM) up -d
 
 .PHONY: up-ml
-up-ml: ## Start ML services (clickhouse, minio, mlflow)
-	$(COMPOSE) $(P_ML) up -d
+up-ml: ## Start core + ML services (mlflow, clickhouse)
+	$(COMPOSE) $(P_CORE) $(P_ML) up -d
 
 .PHONY: up-obs
 up-obs: ## Start observability services (prometheus, grafana)
@@ -291,6 +291,13 @@ reconstruct: ## Reconstruct stream features from Parquet lake  (ROUTE=london AT=
 .PHONY: worker-pipeline
 worker-pipeline: ## Run the batch pipeline once now (raw → staging → marts → scaler)
 	$(COMPOSE) $(P_CORE) $(P_STREAM) run --rm worker python -m app.pipeline
+
+# ---------------------------------------------------------------------------
+# ML training
+# ---------------------------------------------------------------------------
+.PHONY: train
+train: ## Train Ridge + HGB, log to MLflow, register and promote best model
+	$(COMPOSE) $(P_CORE) $(P_ML) run --rm trainer
 
 # ---------------------------------------------------------------------------
 # Utilities

@@ -1,7 +1,7 @@
 -- 002_weather.sql
 -- raw.weather_readings → staging.weather_hourly
 --
--- Parameters (psycopg2 %(name)s style)
+-- Parameters (psycopg2 pyformat / named style)
 --   %(window_start)s  TIMESTAMPTZ  start of ingested_at window (inclusive)
 --   %(window_end)s    TIMESTAMPTZ  end   of ingested_at window (exclusive)
 --

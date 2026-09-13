@@ -361,9 +361,57 @@ services:
       retries: 5
       start_period: 15s
 
-  # mlflow:
-  #   build: ./infra/mlflow
-  #   profiles: [ml]
+  mlflow:
+    build: infra/mlflow
+    profiles: [ml]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MLFLOW_BACKEND_STORE_URI:    postgresql://${POSTGRES_USER:-forecast}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/mlflow
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: s3://mlflow/
+      AWS_ACCESS_KEY_ID:           ${MINIO_SVC_ACCESS_KEY:?MINIO_SVC_ACCESS_KEY is required}
+      AWS_SECRET_ACCESS_KEY:       ${MINIO_SVC_SECRET_KEY:?MINIO_SVC_SECRET_KEY is required}
+      MLFLOW_S3_ENDPOINT_URL:      http://minio:9000
+    ports:
+      - "127.0.0.1:5001:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=4)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
+
+  trainer:
+    build:
+      context: .
+      dockerfile: services/trainer/Dockerfile
+    profiles: [ml]
+    restart: "no"
+    env_file: .env
+    environment:
+      POSTGRES_HOST:         postgres
+      POSTGRES_PORT:         5432
+      POSTGRES_DB:           ${POSTGRES_DB:-forecast}
+      POSTGRES_USER:         ${POSTGRES_USER:-forecast}
+      POSTGRES_PASSWORD:     ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      MLFLOW_TRACKING_URI:   http://mlflow:5000
+      AWS_ACCESS_KEY_ID:     ${MINIO_SVC_ACCESS_KEY:?MINIO_SVC_ACCESS_KEY is required}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SVC_SECRET_KEY:?MINIO_SVC_SECRET_KEY is required}
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      TRAINING_LOOKBACK_DAYS: ${TRAINING_LOOKBACK_DAYS:-30}
+      VAL_DAYS:              ${TRAINER_VAL_DAYS:-7}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
 
   # ---------------------------------------------------------------------------
   # obs  –  prometheus, grafana
