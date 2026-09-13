@@ -1,13 +1,18 @@
 """
-Train Ridge (baseline) and HistGradientBoosting regressors.
+Train a naive baseline plus Ridge and HistGradientBoosting regressors.
 
-Each model type is logged as an independent MLflow run within the configured
-experiment.  Both runs share the same train/val split so their validation
-metrics are directly comparable.
+Run order
+---------
+Run 0  NaiveLastDay      — demand_lag_24h as prediction (no fitting, no
+                           artifact).  Logged first so every subsequent run
+                           appears beneath it in the MLflow UI.
+Run 1  Ridge             — imputed + scaled linear model.
+Run 2  HistGradientBoosting — gradient-boosted trees, NaN-native.
 
-The function ``run_training`` returns the single best ``TrainResult``
-(lowest val_mae).  The caller logs the split details and passes the result to
-``promote.register_and_maybe_promote``.
+All three runs share the same train/val split so their validation metrics
+are directly comparable.  ``run_training`` returns the best *fitted* result
+(lowest val_mae among Ridge and HGB); the naive baseline is never a
+candidate for registration.
 
 Time-based split guarantee
 --------------------------
@@ -21,6 +26,11 @@ days of data.  No random shuffling is ever performed.  This ensures:
 
 Model pipelines
 ---------------
+NaiveLastDay:
+    y_pred = demand_lag_24h  (yesterday's same hour)
+    NaN rows → imputed with median(demand_lag_24h) from the training set.
+    No sklearn Pipeline; no artifact logged.
+
 Ridge:
     ColumnTransformer
       numeric  → SimpleImputer(median) → StandardScaler
@@ -94,6 +104,71 @@ def _mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Mean Absolute Percentage Error; guarded against zero-denominator."""
     denom = np.maximum(np.abs(y_true), 1e-8)
     return float(np.mean(np.abs(y_true - y_pred) / denom))
+
+
+# ---------------------------------------------------------------------------
+# Naive baseline (run 0)
+# ---------------------------------------------------------------------------
+
+def _naive_baseline_run(
+    val_df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    shared_params: dict[str, Any],
+) -> tuple[str, float, float, float]:
+    """Log the 'yesterday same hour' naive baseline as MLflow run 0.
+
+    Prediction is ``demand_lag_24h`` — the value observed exactly 24 h before
+    each validation hour.  Rows where that lag is NULL (insufficient history)
+    are imputed with the median of ``demand_lag_24h`` across the training set.
+
+    No model artifact is logged; this run exists purely as a comparison floor
+    so that every other run in the experiment can be evaluated relative to
+    "doing nothing clever".
+
+    Returns
+    -------
+    (run_id, val_mae, val_rmse, val_mape)
+    """
+    lag_raw = train_df["demand_lag_24h"].median()
+    lag_median = float(lag_raw) if pd.notna(lag_raw) else 0.0
+
+    y_pred = val_df["demand_lag_24h"].fillna(lag_median).to_numpy()
+    y_true = val_df[TARGET_COL].to_numpy()
+
+    val_mae  = float(mean_absolute_error(y_true, y_pred))
+    val_rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    val_mape = _mape(y_true, y_pred)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    params: dict[str, Any] = {
+        **shared_params,
+        "model_type":  "NaiveLastDay",
+        "prediction":  "demand_lag_24h; nan→train_median",
+        "lag_median":  round(lag_median, 4),
+    }
+
+    with mlflow.start_run(
+        run_name=f"NaiveLastDay-{ts}",
+        tags={"model_type": "NaiveLastDay"},
+    ) as run:
+        mlflow.log_params(params)
+        mlflow.log_metrics({
+            "val_mae":  val_mae,
+            "val_rmse": val_rmse,
+            "val_mape": val_mape,
+        })
+        run_id = run.info.run_id
+
+    log.info(
+        "baseline_run_logged",
+        model_type="NaiveLastDay",
+        run_id=run_id,
+        val_mae=round(val_mae, 4),
+        val_rmse=round(val_rmse, 4),
+        val_mape=round(val_mape, 4),
+        note="lag_24h → train median for nulls",
+    )
+    return run_id, val_mae, val_rmse, val_mape
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +372,7 @@ def run_training(df: pd.DataFrame, settings: Settings) -> TrainResult:
         val_rows=len(val_df),
         split_date=split_date_dt.isoformat(),
         data_snapshot_hash=data_hash,
-        models=list(_PIPELINE_FACTORIES.keys()),
+        models=["NaiveLastDay"] + list(_PIPELINE_FACTORIES.keys()),
     )
 
     X_train, y_train = train_df[FEATURE_COLS], train_df[TARGET_COL]
@@ -306,6 +381,12 @@ def run_training(df: pd.DataFrame, settings: Settings) -> TrainResult:
     # Remove non-serialisable helper key before passing to MLflow log_params.
     loggable_shared = {k: v for k, v in shared_params.items() if k != "split_date_dt"}
 
+    # ── Run 0: naive baseline ─────────────────────────────────────────────
+    _baseline_run_id, baseline_mae, _baseline_rmse, _baseline_mape = (
+        _naive_baseline_run(val_df, train_df, loggable_shared)
+    )
+
+    # ── Runs 1-N: fitted models ───────────────────────────────────────────
     results: list[TrainResult] = []
     for model_type, factory in _PIPELINE_FACTORIES.items():
         result = _train_one(
@@ -324,6 +405,8 @@ def run_training(df: pd.DataFrame, settings: Settings) -> TrainResult:
         model_type=best.model_type,
         run_id=best.run_id,
         val_mae=round(best.val_mae, 4),
+        baseline_mae=round(baseline_mae, 4),
+        improvement_vs_baseline=round(baseline_mae - best.val_mae, 4),
         runner_up={r.model_type: round(r.val_mae, 4) for r in results if r is not best},
     )
     return best
