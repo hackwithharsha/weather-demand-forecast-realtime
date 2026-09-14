@@ -13,6 +13,8 @@ RUN mkdir -p tools && touch tools/__init__.py \
 COPY __init__.py     tools/__init__.py
 COPY lake.py         tools/lake.py
 COPY bench.py        tools/bench.py
+COPY backfill.py     tools/backfill.py
+COPY replay.py       tools/replay.py
 COPY reconstruct.py  tools/reconstruct.py
 COPY skew_check.py   tools/skew_check.py
 

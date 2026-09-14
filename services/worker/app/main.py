@@ -52,6 +52,7 @@ from apscheduler.triggers.cron import CronTrigger
 from common.log import configure_logging
 from common.metrics import start_metrics_server
 
+from .auto_retrain import run_auto_retrain
 from .drift import run_drift_check
 from .feature_store import run_feature_store
 from .pipeline import run_pipeline
@@ -125,6 +126,25 @@ def main() -> None:
         coalesce=True,
     )
 
+    scheduler.add_job(
+        run_auto_retrain,
+        CronTrigger(
+            day_of_week=settings.retrain_weekly_day,
+            hour=settings.retrain_weekly_hour,
+            minute=0,
+            timezone="UTC",
+        ),
+        args=[settings],
+        kwargs={"trigger": "weekly"},
+        id="weekly_retrain",
+        name=(
+            f"Weekly auto-retrain "
+            f"({settings.retrain_weekly_day} {settings.retrain_weekly_hour:02d}:00 UTC)"
+        ),
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
     def _shutdown(signum: int, frame: object) -> None:
         log.info("worker_shutdown_signal", signal=signum)
         # Signal consumers to drain and exit.
@@ -140,6 +160,9 @@ def main() -> None:
         pipeline_cron_minute=settings.pipeline_cron_minute,
         feature_store_cron=f"{settings.feature_store_cron_hour:02d}:{settings.feature_store_cron_minute:02d} UTC",
         lookback_days=settings.training_lookback_days,
+        auto_retrain_on_drift=settings.auto_retrain_on_drift,
+        retrain_drift_threshold=settings.retrain_drift_threshold,
+        weekly_retrain=f"{settings.retrain_weekly_day} {settings.retrain_weekly_hour:02d}:00 UTC",
     )
 
     # Immediate first run of the hourly pipeline only.

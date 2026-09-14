@@ -130,7 +130,11 @@ test-trainer: ## Run trainer unit tests (no live services needed)
 	$(COMPOSE) run --no-deps --rm trainer pytest tests/ -v
 
 .PHONY: test
-test: test-common test-trainer ## Run all tests
+test: test-common test-trainer ## Run all unit tests
+
+.PHONY: test-integration
+test-integration: ## Run integration tests (requires core services up: make up)
+	$(COMPOSE) $(P_CORE) run --rm worker pytest tests/integration/ -v
 
 .PHONY: test-%
 test-%: ## Run tests for a compose service  (e.g. make test-api)
@@ -304,6 +308,33 @@ reconstruct: ## Reconstruct stream features from Parquet lake  (ROUTE=london AT=
 .PHONY: worker-pipeline
 worker-pipeline: ## Run the batch pipeline once now (raw → staging → marts → scaler)
 	$(COMPOSE) $(P_CORE) $(P_STREAM) run --rm worker python -m app.pipeline
+
+# ---------------------------------------------------------------------------
+# Backfill (Parquet lake → raw.*)
+# ---------------------------------------------------------------------------
+.PHONY: backfill
+backfill: ## Replay Parquet lake → raw.* for DATE_START..DATE_END; then make worker-pipeline
+	@test -n "$(DATE_START)" || (printf 'Usage: make backfill DATE_START=YYYY-MM-DD DATE_END=YYYY-MM-DD\n' >&2; exit 1)
+	@test -n "$(DATE_END)"   || (printf 'Usage: make backfill DATE_START=YYYY-MM-DD DATE_END=YYYY-MM-DD\n' >&2; exit 1)
+	$(COMPOSE) $(P_CORE) $(P_TOOLS) run --rm lake \
+		python -m tools.backfill \
+			--date-start $(DATE_START) \
+			--date-end   $(DATE_END) \
+			$(if $(TABLES),--tables $(TABLES),) \
+			$(if $(filter 1 true yes,$(DRY_RUN)),--dry-run,)
+
+# ---------------------------------------------------------------------------
+# Replay (reset Kafka consumer group offsets)
+# ---------------------------------------------------------------------------
+.PHONY: replay
+replay: ## Reset consumer group to TIMESTAMP (GROUP=ingestor-demand TS=2026-09-14T10:00:00)
+	@test -n "$(GROUP)" || (printf 'Usage: make replay GROUP=<group-id> TS=<iso8601-timestamp>\n' >&2; exit 1)
+	@test -n "$(TS)"    || (printf 'Usage: make replay GROUP=<group-id> TS=<iso8601-timestamp>\n' >&2; exit 1)
+	$(COMPOSE) $(P_CORE) $(P_STREAM) $(P_TOOLS) run --rm lake \
+		python -m tools.replay \
+			--group $(GROUP) \
+			--timestamp $(TS) \
+			$(if $(TOPIC),--topic $(TOPIC),)
 
 # ---------------------------------------------------------------------------
 # API reload

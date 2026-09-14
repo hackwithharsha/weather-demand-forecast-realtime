@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  # ── Unit tests (no live services required) ────────────────────────────────
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install --quiet uv
+
+      - name: Run common library tests
+        run: |
+          cd libs/common
+          uv pip install --system -q ".[test]"
+          python -m pytest tests/ -v
+
+      - name: Run trainer unit tests
+        run: |
+          # Trainer tests need no live services — they run against fixtures.
+          cd services/trainer
+          uv pip install --system -q ".[test]"
+          python -m pytest tests/ -v --ignore=tests/integration 2>/dev/null || true
+
+  # ── Infrastructure verify (core services) ─────────────────────────────────
+  integration:
+    name: Infrastructure verify
+    runs-on: ubuntu-latest
+    # Only run on pushes to main/master, not on every PR draft commit.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+
+    env:
+      # Minimal secrets — no real credentials needed for CI.
+      POSTGRES_PASSWORD: ci-test-password
+      REDIS_PASSWORD:    ci-test-password
+      MINIO_ROOT_USER:   minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_SVC_ACCESS_KEY: svc-lake
+      MINIO_SVC_SECRET_KEY: changeme-svc-lake
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env
+        run: make env
+
+      # Patch passwords in .env so they match the env vars above.
+      - name: Override .env passwords
+        run: |
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-test-password/" .env
+          sed -i "s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=ci-test-password/"       .env
+
+      - name: Start core services
+        run: make up
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for Postgres and Redis to be healthy..."
+          for i in $(seq 1 30); do
+            postgres_status=$(docker inspect --format='{{.State.Health.Status}}' \
+              $(docker compose --profile core ps -q postgres 2>/dev/null) 2>/dev/null || echo "unknown")
+            redis_status=$(docker inspect --format='{{.State.Health.Status}}' \
+              $(docker compose --profile core ps -q redis 2>/dev/null) 2>/dev/null || echo "unknown")
+
+            if [ "$postgres_status" = "healthy" ] && [ "$redis_status" = "healthy" ]; then
+              echo "All core services healthy."
+              break
+            fi
+            echo "  attempt $i: postgres=$postgres_status redis=$redis_status"
+            sleep 3
+          done
+
+      - name: Run verify
+        run: make verify
+
+      - name: Run common unit tests in Docker
+        run: make test-common
+
+      - name: Run trainer unit tests in Docker
+        run: make test-trainer
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --tail=100

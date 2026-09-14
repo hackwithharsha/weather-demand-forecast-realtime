@@ -73,6 +73,16 @@ class Settings(BaseSettings):
     drift_current_hours:          int = 24   # hours of prediction_features as current window
     drift_min_current_rows:       int = 20   # skip if fewer rows than this
 
+    # Auto-retrain on drift
+    auto_retrain_on_drift:    bool  = True   # enable drift-triggered retraining
+    retrain_drift_threshold:  float = 0.3    # Evidently score that triggers a run
+    retrain_lookback_days:    int   = 30     # days of mart history to train on
+    retrain_val_days:         int   = 7      # days withheld as holdout
+
+    # Weekly scheduled retrain (APScheduler CronTrigger)
+    retrain_weekly_day:  str = "sun"         # day_of_week
+    retrain_weekly_hour: int = 4             # hour (UTC)
+
     @property
     def postgres_dsn(self) -> str:
         return (

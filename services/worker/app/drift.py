@@ -33,6 +33,7 @@ import psycopg2
 import psycopg2.extras
 import structlog
 
+from .auto_retrain import maybe_trigger_retrain
 from .metrics import (
     drift_detected_gauge,
     drift_job_current_count,
@@ -254,6 +255,18 @@ def run_drift_check(settings: Settings) -> None:
                 count=len(rows_to_insert),
                 checked_at=checked_at.isoformat(),
             )
+
+            # Trigger auto-retrain when any feature exceeds the threshold.
+            drift_summary = [
+                {
+                    "feature":  feature_name,
+                    "score":    drift_score if drift_score is not None else 0.0,
+                    "detected": drift_det,
+                }
+                for (_, feature_name, drift_score, drift_det, *_rest)
+                in rows_to_insert
+            ]
+            maybe_trigger_retrain(settings, drift_summary)
 
     except Exception:
         log.exception("drift_check_failed")
