@@ -30,7 +30,8 @@ def _build_dsn() -> str | None:
 def pg_conn():
     """Open a psycopg2 connection inside a transaction; roll back on teardown.
 
-    Skipped when no Postgres DSN is configured (unit-test environment).
+    Skipped when no Postgres DSN is configured, or when the server is not
+    reachable (e.g. unit-test run with --no-deps).
     All data written by the test is undone automatically — nothing persists.
     """
     dsn = _build_dsn()
@@ -39,7 +40,10 @@ def pg_conn():
             "No Postgres connection available. "
             "Set POSTGRES_DSN or POSTGRES_PASSWORD to run integration tests."
         )
-    conn = psycopg2.connect(dsn)
+    try:
+        conn = psycopg2.connect(dsn, connect_timeout=3)
+    except psycopg2.OperationalError as exc:
+        pytest.skip(f"Postgres not reachable (start services with make up): {exc}")
     conn.autocommit = False
     yield conn
     conn.rollback()

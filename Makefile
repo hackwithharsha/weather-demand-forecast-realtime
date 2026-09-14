@@ -8,6 +8,7 @@ P_ML     := --profile ml
 P_OBS    := --profile obs
 P_UI     := --profile ui
 P_UI_DEV := --profile ui-dev
+P_TEST   := --profile test
 P_ALL    := $(P_CORE) $(P_STREAM) $(P_TOOLS) $(P_ML) $(P_OBS) $(P_UI)
 
 .DEFAULT_GOAL := help
@@ -117,27 +118,45 @@ inspect-features: ## Dump all feat:route:* keys and their hash fields from Redis
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
-.PHONY: test-common
-test-common: ## Run libs/common unit tests (pure Python, no services needed)
-	docker run --rm \
-		-v "$(PWD)/libs/common:/app" \
-		-w /app \
-		python:3.12-slim \
-		sh -c "pip install -q uv && uv pip install --system -q '.[test]' && python -m pytest tests/ -v"
+# Three tiers — all run inside containers, none touch the host directly.
+#
+#   make test-unit         No live services needed.  Run with --no-deps so
+#                          Postgres-dependent fixtures auto-skip cleanly.
+#
+#   make test-integration  Needs Postgres + Redis + API.  Run after: make up
+#
+#   make test-e2e          Full path: raw insert → pipeline → /predict.
+#                          Needs core + stream profiles.  Run after: make up-stream
+#
+#   make test              All three tiers in order.  Requires core+stream up.
+# ---------------------------------------------------------------------------
 
-.PHONY: test-trainer
-test-trainer: ## Run trainer unit tests (no live services needed)
-	$(COMPOSE) run --no-deps --rm trainer pytest tests/ -v
-
-.PHONY: test
-test: test-common test-trainer ## Run all unit tests
+.PHONY: test-unit
+test-unit: ## Unit tests — all services, no live infrastructure needed
+	$(COMPOSE) $(P_TEST) run --no-deps --rm test-common
+	$(COMPOSE) $(P_TEST) run --no-deps --rm test-ingestor
+	$(COMPOSE) $(P_CORE) run --no-deps --rm trainer \
+		pytest tests/ -v
+	$(COMPOSE) $(P_CORE) run --no-deps --rm api \
+		pytest tests/ -v
+	$(COMPOSE) $(P_CORE) $(P_STREAM) run --no-deps --rm worker \
+		pytest tests/ --ignore=tests/integration --ignore=tests/e2e -v
 
 .PHONY: test-integration
-test-integration: ## Run integration tests (requires core services up: make up)
-	$(COMPOSE) $(P_CORE) run --rm worker pytest tests/integration/ -v
+test-integration: ## Integration tests — requires: make up (core + stream)
+	$(COMPOSE) $(P_CORE) $(P_STREAM) run --rm worker \
+		pytest tests/integration/ -v
+
+.PHONY: test-e2e
+test-e2e: ## End-to-end test — requires: make up-stream (full path: insert → pipeline → predict)
+	$(COMPOSE) $(P_CORE) $(P_STREAM) run --rm worker \
+		pytest tests/e2e/ -v
+
+.PHONY: test
+test: test-unit test-integration test-e2e ## Run unit + integration + e2e (requires: make up-stream)
 
 .PHONY: test-%
-test-%: ## Run tests for a compose service  (e.g. make test-api)
+test-%: ## Run pytest for any compose service  (e.g. make test-api)
 	$(COMPOSE) run --rm $* pytest -v
 
 # ---------------------------------------------------------------------------

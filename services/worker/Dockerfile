@@ -30,7 +30,7 @@ FROM base AS dev
 RUN uv pip install --system --no-cache ".[test]"
 
 # Copy tests so they are available inside the container
-COPY services/worker/tests/ ./services/worker/tests/
+COPY services/worker/tests/ ./tests/
 
 USER app
 

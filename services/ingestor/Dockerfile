@@ -1,5 +1,5 @@
 # Build context: repo root  (needed to COPY libs/common)
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -25,3 +25,13 @@ COPY services/ingestor/app/ ./app/
 USER app
 
 CMD ["python", "-m", "app.main"]
+
+# ── dev / test stage ──────────────────────────────────────────────────────
+FROM base AS dev
+
+USER root
+RUN uv pip install --system --no-cache ".[test]"
+
+COPY services/ingestor/tests/ ./tests/
+
+USER app

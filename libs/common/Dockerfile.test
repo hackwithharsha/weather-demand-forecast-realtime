@@ -1,0 +1,19 @@
+# Build context: repo root
+# Standalone image for running libs/common unit tests in CI and make test-unit.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+COPY libs/common/pyproject.toml .
+RUN mkdir -p common && touch common/__init__.py \
+    && uv pip install --system --no-cache ".[test]"
+
+COPY libs/common/common/ ./common/
+COPY libs/common/tests/  ./tests/
+
+CMD ["pytest", "tests/", "-v"]

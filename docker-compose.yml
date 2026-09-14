@@ -639,6 +639,28 @@ services:
       api:
         condition: service_healthy
 
+  # ---------------------------------------------------------------------------
+  # test  –  one-shot test runner services  (make test-unit)
+  # ---------------------------------------------------------------------------
+
+  # Runs libs/common unit tests (pure Python, no services needed).
+  test-common:
+    build:
+      context: .
+      dockerfile: libs/common/Dockerfile.test
+    profiles: [test]
+    restart: "no"
+
+  # Runs services/ingestor unit tests (pure Python, no services needed).
+  test-ingestor:
+    build:
+      context: .
+      dockerfile: services/ingestor/Dockerfile
+      target: dev
+    profiles: [test]
+    restart: "no"
+    command: ["pytest", "tests/", "-v"]
+
 volumes:
   postgres_data:
   redis_data:
