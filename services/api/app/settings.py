@@ -24,4 +24,7 @@ class Settings(BaseSettings):
     aws_secret_access_key: str = ""
     mlflow_s3_endpoint_url: str = "http://minio:9000"
 
+    # Prometheus — used by /pipeline/stats and /drift/* to proxy metric queries
+    prometheus_url: str = "http://prometheus:9090"
+
     model_config = {"env_file": ".env", "extra": "ignore"}

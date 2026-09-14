@@ -2,6 +2,9 @@ import type {
   HistoryResponse,
   ModelInfoResponse,
   ModelVersion,
+  PipelineStats,
+  DriftScores,
+  DriftHistory,
   PromInstant,
   PromSeries,
   PredictResponse,
@@ -65,6 +68,20 @@ export async function promoteStaging(): Promise<{ status: string; promoted_versi
 
 export async function reloadModels(): Promise<{ status: string }> {
   return post(`${API}/admin/reload`);
+}
+
+export async function getPipelineStats(): Promise<PipelineStats> {
+  return get<PipelineStats>(`${API}/pipeline/stats`);
+}
+
+export async function getDriftScores(): Promise<DriftScores> {
+  return get<DriftScores>(`${API}/drift/scores`);
+}
+
+export async function getDriftHistory(windowHours = 6, step = '5m'): Promise<DriftHistory> {
+  return get<DriftHistory>(
+    `${API}/drift/history?window_hours=${windowHours}&step=${encodeURIComponent(step)}`,
+  );
 }
 
 // ── Prometheus helpers ────────────────────────────────────────────────────────

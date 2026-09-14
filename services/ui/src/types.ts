@@ -89,6 +89,57 @@ export interface DriftChartPoint {
   [feature: string]: number | string;
 }
 
+// ── Pipeline stats ──────────────────────────────────────────────────────────
+
+export interface TopicLag {
+  topic: string;
+  lag: number;
+}
+
+export interface PipelineStats {
+  kafka_lag: number | null;
+  rows_per_min: number | null;
+  dlq_total: number | null;
+  last_pipeline_run_ts: number | null;   // Unix seconds
+  msgs_consumed_per_min: number | null;
+  validation_failed_per_min: number | null;
+  lag_by_topic: TopicLag[];
+  prometheus_available: boolean;
+}
+
+// ── Drift types ──────────────────────────────────────────────────────────────
+
+export interface DriftScore {
+  feature: string;
+  score: number;
+  detected: boolean;
+}
+
+export interface DriftScores {
+  scores: DriftScore[];
+  last_run_ts: number | null;       // Unix seconds
+  reference_count: number | null;
+  current_count: number | null;
+  prometheus_available: boolean;
+}
+
+export interface DriftHistoryPoint {
+  ts: number;     // Unix seconds
+  score: number;
+}
+
+export interface DriftSeries {
+  feature: string;
+  points: DriftHistoryPoint[];
+}
+
+export interface DriftHistory {
+  series: DriftSeries[];
+  step: string;
+  window_hours: number;
+  prometheus_available: boolean;
+}
+
 // ── WebSocket message ───────────────────────────────────────────────────────
 
 export interface LiveEvent {

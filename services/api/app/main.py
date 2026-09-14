@@ -21,6 +21,17 @@ POST /admin/reload      Hot-swap Production + Staging from the MLflow registry
                         without restarting.  Uses asyncio.Lock to serialise concurrent
                         reload calls.
 
+GET  /pipeline/stats    Pipeline health snapshot: Kafka consumer lag, ingestor
+                        row throughput, DLQ message count, last worker pipeline
+                        run timestamp.  Proxies Prometheus instant queries
+                        server-side so the browser never talks to Prometheus.
+
+GET  /drift/scores      Per-feature drift scores and job metadata (instant).
+                        Proxies Prometheus instant queries server-side.
+
+GET  /drift/history     Per-feature drift score time series over a rolling
+                        window.  Proxies a Prometheus range query server-side.
+
 Feature-loading strategy
 ------------------------
 1. Base features (lag/rolling/event_count/humidity_pct) are read from
@@ -59,6 +70,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
+import httpx
 import mlflow
 import mlflow.sklearn
 import numpy as np
@@ -1010,6 +1022,262 @@ async def admin_promote() -> dict:
         "staging_version": (
             str(_state.staging_info["version"]) if _state.staging_info else None
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prometheus proxy helpers
+# ---------------------------------------------------------------------------
+
+async def _prom_instant(client: httpx.AsyncClient, query: str) -> list[dict]:
+    """Single Prometheus instant query via an existing AsyncClient.
+
+    Returns an empty list on any HTTP or parse error so callers can treat
+    an unreachable Prometheus as "no data" rather than a 5xx.
+    """
+    try:
+        r = await client.get("/api/v1/query", params={"query": query})
+        if r.status_code == 200:
+            body = r.json()
+            if body.get("status") == "success":
+                return body["data"]["result"]
+    except Exception:
+        pass
+    return []
+
+
+def _scalar(results: list[dict]) -> float | None:
+    """Extract a single float from an instant-query result list."""
+    if not results:
+        return None
+    try:
+        v = float(results[0]["value"][1])
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stats
+# ---------------------------------------------------------------------------
+
+@app.get("/pipeline/stats")
+async def pipeline_stats() -> dict:
+    """Pipeline health snapshot proxied from Prometheus.
+
+    All metric values are ``null`` when Prometheus is unreachable so the UI
+    can render a graceful degraded state without a 5xx from this endpoint.
+
+    Metrics returned
+    ----------------
+    kafka_lag               sum(redpanda_kafka_consumer_group_lag)
+    rows_per_min            sum(rate(ingestor_batch_write_rows_total[5m])) * 60
+    dlq_total               sum(ingestor_messages_dlq_total)
+    last_pipeline_run_ts    worker_pipeline_last_run_timestamp (Unix seconds)
+    msgs_consumed_per_min   sum(rate(ingestor_messages_consumed_total[5m])) * 60
+    validation_failed_per_min  sum(rate(...validation_failed...[5m])) * 60
+    lag_by_topic            per-topic consumer lag, sorted descending
+    """
+    settings = _state.settings
+    if settings is None:
+        raise HTTPException(503, "Service not initialised")
+
+    prom_base = settings.prometheus_url
+
+    async with httpx.AsyncClient(base_url=prom_base, timeout=5.0) as client:
+        (
+            lag_r,
+            rows_r,
+            dlq_r,
+            last_run_r,
+            consumed_r,
+            val_fail_r,
+            lag_by_topic_r,
+        ) = await asyncio.gather(
+            _prom_instant(client, "sum(redpanda_kafka_consumer_group_lag)"),
+            _prom_instant(client, "sum(rate(ingestor_batch_write_rows_total[5m])) * 60"),
+            _prom_instant(client, "sum(ingestor_messages_dlq_total)"),
+            _prom_instant(client, "worker_pipeline_last_run_timestamp"),
+            _prom_instant(client, "sum(rate(ingestor_messages_consumed_total[5m])) * 60"),
+            _prom_instant(client, "sum(rate(ingestor_messages_validation_failed_total[5m])) * 60"),
+            _prom_instant(client, "redpanda_kafka_consumer_group_lag"),
+        )
+
+    lag_by_topic: list[dict] = []
+    for r in lag_by_topic_r:
+        try:
+            topic = (
+                r["metric"].get("topic")
+                or r["metric"].get("group")
+                or "unknown"
+            )
+            lag_val = float(r["value"][1])
+            if math.isfinite(lag_val):
+                lag_by_topic.append({"topic": topic, "lag": lag_val})
+        except Exception:
+            pass
+    lag_by_topic.sort(key=lambda x: -x["lag"])
+
+    prom_available = bool(lag_r or rows_r or dlq_r or last_run_r)
+
+    return {
+        "kafka_lag":                _scalar(lag_r),
+        "rows_per_min":             _scalar(rows_r),
+        "dlq_total":                _scalar(dlq_r),
+        "last_pipeline_run_ts":     _scalar(last_run_r),
+        "msgs_consumed_per_min":    _scalar(consumed_r),
+        "validation_failed_per_min": _scalar(val_fail_r),
+        "lag_by_topic":             lag_by_topic,
+        "prometheus_available":     prom_available,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Drift scores (instant)
+# ---------------------------------------------------------------------------
+
+@app.get("/drift/scores")
+async def drift_scores() -> dict:
+    """Current per-feature drift scores and job metadata proxied from Prometheus.
+
+    Returns ``prometheus_available: false`` and empty ``scores`` when
+    Prometheus is unreachable; never raises a 5xx for metric unavailability.
+    """
+    settings = _state.settings
+    if settings is None:
+        raise HTTPException(503, "Service not initialised")
+
+    prom_base = settings.prometheus_url
+
+    async with httpx.AsyncClient(base_url=prom_base, timeout=5.0) as client:
+        score_r, detected_r, last_run_r, ref_count_r, cur_count_r = (
+            await asyncio.gather(
+                _prom_instant(client, "drift_score"),
+                _prom_instant(client, "drift_detected"),
+                _prom_instant(client, "drift_job_last_run_timestamp"),
+                _prom_instant(client, "drift_job_reference_count"),
+                _prom_instant(client, "drift_job_current_count"),
+            )
+        )
+
+    # Build a feature → detected lookup from the drift_detected series
+    detected_map: dict[str, bool] = {}
+    for r in detected_r:
+        feat = r["metric"].get("feature", "")
+        try:
+            detected_map[feat] = float(r["value"][1]) >= 0.5
+        except Exception:
+            pass
+
+    scores: list[dict] = []
+    for r in score_r:
+        feat = r["metric"].get("feature", "")
+        try:
+            v = float(r["value"][1])
+            if math.isfinite(v):
+                scores.append({
+                    "feature": feat,
+                    "score": round(v, 6),
+                    "detected": detected_map.get(feat, v > 0.2),
+                })
+        except Exception:
+            pass
+    scores.sort(key=lambda x: -x["score"])
+
+    ref_v = _scalar(ref_count_r)
+    cur_v = _scalar(cur_count_r)
+
+    return {
+        "scores": scores,
+        "last_run_ts": _scalar(last_run_r),
+        "reference_count": int(ref_v) if ref_v is not None else None,
+        "current_count": int(cur_v) if cur_v is not None else None,
+        "prometheus_available": bool(score_r or detected_r),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Drift history (range)
+# ---------------------------------------------------------------------------
+
+@app.get("/drift/history")
+async def drift_history(window_hours: int = 6, step: str = "5m") -> dict:
+    """Per-feature drift score time series proxied from a Prometheus range query.
+
+    Query params
+    ------------
+    window_hours   How many hours of history to return (default 6).
+    step           Prometheus step resolution (default '5m').
+
+    Returns ``prometheus_available: false`` and ``series: []`` when
+    Prometheus is unreachable; never raises a 5xx for metric unavailability.
+    """
+    settings = _state.settings
+    if settings is None:
+        raise HTTPException(503, "Service not initialised")
+
+    window_hours = max(1, min(window_hours, 72))
+    now_ts = int(time.time())
+    start_ts = now_ts - window_hours * 3600
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=settings.prometheus_url, timeout=10.0
+        ) as client:
+            r = await client.get(
+                "/api/v1/query_range",
+                params={
+                    "query": "drift_score",
+                    "start": str(start_ts),
+                    "end": str(now_ts),
+                    "step": step,
+                },
+            )
+    except Exception:
+        return {
+            "series": [],
+            "step": step,
+            "window_hours": window_hours,
+            "prometheus_available": False,
+        }
+
+    if r.status_code != 200:
+        return {
+            "series": [],
+            "step": step,
+            "window_hours": window_hours,
+            "prometheus_available": False,
+        }
+
+    body = r.json()
+    if body.get("status") != "success":
+        return {
+            "series": [],
+            "step": step,
+            "window_hours": window_hours,
+            "prometheus_available": False,
+        }
+
+    series: list[dict] = []
+    for s in body["data"]["result"]:
+        feat = s["metric"].get("feature", "")
+        points: list[dict] = []
+        for ts, val in s["values"]:
+            try:
+                v = float(val)
+                if math.isfinite(v):
+                    points.append({"ts": int(ts), "score": round(v, 6)})
+            except Exception:
+                pass
+        if points:
+            series.append({"feature": feat, "points": points})
+    series.sort(key=lambda x: x["feature"])
+
+    return {
+        "series": series,
+        "step": step,
+        "window_hours": window_hours,
+        "prometheus_available": True,
     }
 
 
