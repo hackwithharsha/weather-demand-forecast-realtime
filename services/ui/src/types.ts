@@ -78,8 +78,7 @@ export interface PromSeries {
 // ── Chart data types ────────────────────────────────────────────────────────
 
 export interface LiveChartPoint {
-  t: string;        // ISO timestamp (for sorting)
-  label: string;    // "Mon 14:00" (for axis display)
+  ts: number;       // Unix ms — used as the numeric x-axis key
   actual?: number;
   predicted?: number;
 }

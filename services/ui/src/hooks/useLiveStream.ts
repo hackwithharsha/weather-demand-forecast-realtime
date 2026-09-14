@@ -1,60 +1,107 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { LiveEvent } from '../types';
 
-interface UseLiveStreamResult {
+// ── Reconnect schedule ───────────────────────────────────────────────────────
+// Delay doubles on each failure, capped at MAX_DELAY_MS, with random jitter to
+// prevent thundering-herd when many tabs reconnect simultaneously.
+const INITIAL_DELAY_MS = 1_000;
+const MAX_DELAY_MS     = 30_000;
+const JITTER_MS        = 500;
+
+export type WsStatus = 'connecting' | 'connected' | 'disconnected';
+
+export interface UseLiveStreamResult {
   lastEvent: LiveEvent | null;
-  connected: boolean;
+  /** Current WebSocket lifecycle state. */
+  status: WsStatus;
+  /**
+   * Number of reconnect attempts since the last successful connection.
+   * 0 on the very first connect attempt, ≥1 after any drop.
+   * Useful in the UI to distinguish "initial connect" from "reconnecting".
+   */
+  attempts: number;
 }
 
-/**
- * Maintains a single WebSocket to /ws/live.
- * Components subscribe by reading `lastEvent` and reacting via useEffect.
- * The connection is created once on mount and closed on unmount.
- */
 export function useLiveStream(): UseLiveStreamResult {
   const [lastEvent, setLastEvent] = useState<LiveEvent | null>(null);
-  const [connected, setConnected] = useState(false);
+  const [status,    setStatus]    = useState<WsStatus>('connecting');
+  const [attempts,  setAttempts]  = useState(0);
+
+  // Refs hold mutable values that should NOT re-trigger the effect when changed.
+  const wsRef      = useRef<WebSocket | null>(null);
+  const timerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const delayRef   = useRef(INITIAL_DELAY_MS);
+  const unmounted  = useRef(false);
 
   useEffect(() => {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${location.host}/ws/live`;
-    let ws: WebSocket;
-    let closed = false;
+    unmounted.current = false;
 
-    function connect() {
-      ws = new WebSocket(url);
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url   = `${proto}//${location.host}/ws/live`;
+
+    function connect(attempt: number) {
+      if (unmounted.current) return;
+
+      setStatus('connecting');
+      setAttempts(attempt);
+
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
 
       ws.onopen = () => {
-        if (!closed) setConnected(true);
+        if (unmounted.current) { ws.close(); return; }
+        delayRef.current = INITIAL_DELAY_MS; // reset backoff on success
+        setStatus('connected');
       };
 
-      ws.onclose = () => {
-        setConnected(false);
-        // Reconnect after 3 s if the component is still mounted
-        if (!closed) setTimeout(connect, 3_000);
+      ws.onmessage = (e: MessageEvent<string>) => {
+        if (unmounted.current) return;
+        try {
+          setLastEvent(JSON.parse(e.data) as LiveEvent);
+        } catch {
+          // ignore malformed frames
+        }
       };
 
       ws.onerror = () => {
-        ws.close();
+        // Browser always fires onclose after onerror; reconnect logic lives there.
       };
 
-      ws.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data as string) as LiveEvent;
-          if (!closed) setLastEvent(msg);
-        } catch {
-          // ignore malformed messages
-        }
+      ws.onclose = () => {
+        if (unmounted.current) return;
+
+        wsRef.current = null;
+        setStatus('disconnected');
+
+        // Schedule reconnect with exponential backoff + jitter.
+        const delay = delayRef.current + Math.random() * JITTER_MS;
+        timerRef.current = setTimeout(() => {
+          timerRef.current = null;
+          delayRef.current = Math.min(delayRef.current * 2, MAX_DELAY_MS);
+          connect(attempt + 1);
+        }, delay);
       };
     }
 
-    connect();
+    connect(0);
 
     return () => {
-      closed = true;
-      ws?.close();
-    };
-  }, []);
+      unmounted.current = true;
 
-  return { lastEvent, connected };
+      // Clear any pending reconnect timer first, then close the socket.
+      // Nulling ws.onclose before close() prevents the close handler from
+      // scheduling another reconnect after teardown.
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+      if (wsRef.current !== null) {
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, []); // runs once — WebSocket lifecycle is self-managed via reconnect loop
+
+  return { lastEvent, status, attempts };
 }
