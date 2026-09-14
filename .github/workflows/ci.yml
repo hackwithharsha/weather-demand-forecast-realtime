@@ -1,56 +1,49 @@
 name: CI
 
+# Triggers: every push to main and every pull-request targeting main.
+# Jobs:
+#   lint        → ruff check + format (host, seconds)
+#   unit        → make test-unit  (all services, no live infra, containers only)
+#   integration → make test-integration  (needs postgres + redis up)
+#   e2e         → make test-e2e  (needs full core stack; push to main only)
+#
+# Hard rule: no application code runs on the host.  All test execution happens
+# inside Docker containers via the make test-* targets.
+
 on:
   push:
-    branches: ["main", "master"]
+    branches: [main]
   pull_request:
-    branches: ["main", "master"]
+
+env:
+  # Safe placeholder credentials — nothing real runs here.
+  POSTGRES_PASSWORD: ci-postgres
+  REDIS_PASSWORD:    ci-redis
 
 jobs:
-  # ── Unit tests (no live services required) ────────────────────────────────
-  unit-tests:
-    name: Unit tests
+
+  # ── 1. Lint ─────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (ruff)
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Install ruff
+        run: pip install --quiet ruff
 
-      - name: Install uv
-        run: pip install --quiet uv
+      - name: Check style and imports
+        run: ruff check libs/ services/ tools/
 
-      - name: Run common library tests
-        run: |
-          cd libs/common
-          uv pip install --system -q ".[test]"
-          python -m pytest tests/ -v
+      - name: Check formatting
+        run: ruff format --check libs/ services/ tools/
 
-      - name: Run trainer unit tests
-        run: |
-          # Trainer tests need no live services — they run against fixtures.
-          cd services/trainer
-          uv pip install --system -q ".[test]"
-          python -m pytest tests/ -v --ignore=tests/integration 2>/dev/null || true
-
-  # ── Infrastructure verify (core services) ─────────────────────────────────
-  integration:
-    name: Infrastructure verify
+  # ── 2. Unit tests (no live services) ────────────────────────────────────────
+  unit:
+    name: Unit tests
     runs-on: ubuntu-latest
-    # Only run on pushes to main/master, not on every PR draft commit.
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
-
-    env:
-      # Minimal secrets — no real credentials needed for CI.
-      POSTGRES_PASSWORD: ci-test-password
-      REDIS_PASSWORD:    ci-test-password
-      MINIO_ROOT_USER:   minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_SVC_ACCESS_KEY: svc-lake
-      MINIO_SVC_SECRET_KEY: changeme-svc-lake
+    needs: lint
 
     steps:
       - uses: actions/checkout@v4
@@ -58,40 +51,122 @@ jobs:
       - name: Create .env
         run: make env
 
-      # Patch passwords in .env so they match the env vars above.
-      - name: Override .env passwords
+      - name: Set CI credentials in .env
         run: |
-          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci-test-password/" .env
-          sed -i "s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=ci-test-password/"       .env
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${POSTGRES_PASSWORD}/" .env
+          sed -i "s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=${REDIS_PASSWORD}/"         .env
 
-      - name: Start core services
+      # Build all images needed by make test-unit up-front so failures surface
+      # before running any test step.
+      - name: Build test images
+        run: |
+          docker compose --profile test  build test-common test-ingestor
+          docker compose --profile core  build trainer api
+          docker compose --profile core --profile stream build worker
+
+      # Runs all five service test suites with --no-deps; postgres-dependent
+      # fixtures skip cleanly instead of erroring.
+      - name: Run unit tests (all services, no live infrastructure)
+        run: make test-unit
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
+
+  # ── 3. Integration tests ─────────────────────────────────────────────────────
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: unit
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env
+        run: make env
+
+      - name: Set CI credentials in .env
+        run: |
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${POSTGRES_PASSWORD}/" .env
+          sed -i "s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=${REDIS_PASSWORD}/"         .env
+
+      - name: Start core services (postgres, redis, minio, api)
         run: make up
 
-      - name: Wait for services to be healthy
+      - name: Wait for postgres and redis to be healthy
+        timeout-minutes: 2
         run: |
-          echo "Waiting for Postgres and Redis to be healthy..."
-          for i in $(seq 1 30); do
-            postgres_status=$(docker inspect --format='{{.State.Health.Status}}' \
-              $(docker compose --profile core ps -q postgres 2>/dev/null) 2>/dev/null || echo "unknown")
-            redis_status=$(docker inspect --format='{{.State.Health.Status}}' \
-              $(docker compose --profile core ps -q redis 2>/dev/null) 2>/dev/null || echo "unknown")
+          until [ "$(docker inspect --format='{{.State.Health.Status}}' \
+            "$(docker compose --profile core ps -q postgres)" 2>/dev/null)" = "healthy" ]; do
+            sleep 2
+          done
+          until [ "$(docker inspect --format='{{.State.Health.Status}}' \
+            "$(docker compose --profile core ps -q redis)" 2>/dev/null)" = "healthy" ]; do
+            sleep 2
+          done
+          echo "postgres and redis: healthy"
 
-            if [ "$postgres_status" = "healthy" ] && [ "$redis_status" = "healthy" ]; then
-              echo "All core services healthy."
-              break
-            fi
-            echo "  attempt $i: postgres=$postgres_status redis=$redis_status"
-            sleep 3
+      # Migrations must run before integration tests so staging / mart schemas
+      # exist.  The alembic service is idempotent (IF NOT EXISTS throughout).
+      - name: Apply database migrations
+        run: make migrate
+
+      - name: Build worker image
+        run: docker compose --profile core --profile stream build worker
+
+      - name: Run integration tests
+        run: make test-integration
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
+
+  # ── 4. End-to-end test (push to main only) ───────────────────────────────────
+  # Requires the full core stack (postgres + redis + api).  The test inserts
+  # rows directly into Postgres, runs the batch pipeline inside the worker
+  # container, then calls the live API via http://api:8000.
+  e2e:
+    name: End-to-end test
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env
+        run: make env
+
+      - name: Set CI credentials in .env
+        run: |
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${POSTGRES_PASSWORD}/" .env
+          sed -i "s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=${REDIS_PASSWORD}/"         .env
+
+      - name: Start core services (postgres, redis, minio, api)
+        run: make up
+
+      # Wait for all three services the e2e test depends on.  The API healthcheck
+      # (GET /health → 200) is defined in docker-compose.yml so docker inspect
+      # reliably returns "healthy" once uvicorn is accepting requests.
+      - name: Wait for postgres, redis, and api to be healthy
+        timeout-minutes: 3
+        run: |
+          for svc in postgres redis api; do
+            until [ "$(docker inspect --format='{{.State.Health.Status}}' \
+              "$(docker compose --profile core ps -q $svc)" 2>/dev/null)" = "healthy" ]; do
+              sleep 2
+            done
+            echo "$svc: healthy"
           done
 
-      - name: Run verify
-        run: make verify
+      - name: Apply database migrations
+        run: make migrate
 
-      - name: Run common unit tests in Docker
-        run: make test-common
+      - name: Build worker image
+        run: docker compose --profile core --profile stream build worker
 
-      - name: Run trainer unit tests in Docker
-        run: make test-trainer
+      - name: Run end-to-end test
+        run: make test-e2e
 
       - name: Show service logs on failure
         if: failure()

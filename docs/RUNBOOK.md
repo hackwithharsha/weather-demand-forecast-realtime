@@ -1,15 +1,22 @@
 # Operations Runbook
 
-Diagnosing and resolving every alert defined in `infra/prometheus/alerts.yml`.
+For each alert defined in `infra/prometheus/alerts.yml`:
+- **Symptom** — what you observe when the alert fires
+- **Likely causes** — the most probable root causes, ordered by frequency
+- **Diagnostic commands** — what to run first
+- **Fix** — how to resolve each cause
+
+Open Prometheus at http://localhost:9090 and Grafana at http://localhost:3001
+to correlate metrics while following these steps.
 
 ---
 
 ## Alert index
 
-| Alert | Severity | Default threshold |
+| Alert | Severity | Fires when |
 |---|---|---|
-| [KafkaConsumerLagHigh](#kafkaconsumerlaghigh) | warning | > 1000 messages for 5 min |
-| [FeatureDriftHigh](#featuredrif​thigh) | warning | drift_score > 0.2 (immediate) |
+| [KafkaConsumerLagHigh](#kafkaconsumerlaghigh) | warning | consumer lag > 1 000 messages for 5 min |
+| [FeatureDriftHigh](#featuredrif​thigh) | warning | any feature drift_score > 0.2 (immediate) |
 | [PredictionLatencyHigh](#predictionlatencyhigh) | warning | /predict p99 > 500 ms for 5 min |
 | [ModelNotTrainedRecently](#modelnottrainedrecently) | warning | no training run in 48 h, or metric absent |
 
@@ -17,67 +24,77 @@ Diagnosing and resolving every alert defined in `infra/prometheus/alerts.yml`.
 
 ## KafkaConsumerLagHigh
 
-**Expression:** `redpanda_kafka_consumer_group_lag > 1000` for 5 m
-
-**What it means:** A consumer group (ingestor-demand or ingestor-weather) is
-more than 1000 messages behind the producer.  Sustained lag means raw events
-are not being written to Postgres, which delays staging, marts, and predictions.
-
-### Diagnosis
-
-```bash
-# 1. Check which group(s) and partitions are lagging
-make up-obs   # ensure Prometheus is running
-# Open http://localhost:9090 → Graph:
-#   redpanda_kafka_consumer_group_lag
-
-# 2. Is the ingestor running?
-docker compose --profile stream ps ingestor
-
-# 3. Is the ingestor healthy?
-docker compose --profile stream logs --tail=50 ingestor
-
-# 4. Is Redpanda itself healthy?
-docker compose --profile stream ps redpanda
-curl -s http://localhost:9644/v1/brokers | python3 -m json.tool
+```
+redpanda_kafka_consumer_group_lag > 1000   for: 5m
 ```
 
-### Common causes and fixes
+### Symptom
+
+Alertmanager fires with the consumer group name, topic, and partition in the
+labels.  The Grafana **Pipeline Health** dashboard shows the lag counter
+climbing.  No new rows appear in `raw.demand_events` or `raw.weather_readings`;
+the Ingestor service is falling behind.
+
+### Likely causes
+
+1. **Ingestor container crashed or is OOM-killed** — most common
+2. **Postgres write latency spike** — batch inserts timing out or taking too long
+3. **Producer burst** — load test or seed job flooded the topic temporarily
+4. **Redpanda rebalancing** — group rebalance after a broker restart (transient)
+5. **Ingestor never started** — stream profile not running
+
+### Diagnostic commands
+
+```bash
+# Which group and partition is lagging?
+# Prometheus → Graph: redpanda_kafka_consumer_group_lag
+
+# Is the ingestor running?
+docker compose --profile stream ps ingestor
+
+# Is it crashing / restarting?
+docker compose --profile stream logs --tail=50 ingestor
+
+# Is Redpanda itself healthy?
+docker compose --profile stream ps redpanda
+curl -s http://localhost:9644/v1/brokers | python3 -m json.tool
+
+# Is Postgres accepting connections?
+make shell-db
+```
+
+### Fix
 
 | Cause | Fix |
 |---|---|
 | Ingestor container crashed | `docker compose --profile stream up -d ingestor` |
-| Postgres connection failure | Check `POSTGRES_PASSWORD` in `.env`; `make shell-db` to verify connectivity |
-| Ingestor too slow (batch write timeout) | Reduce `PARQUET_FLUSH_INTERVAL_S` in `.env`; scale ingestor replicas |
-| Producer burst (load test / seed job) | Lag is transient — monitor; if sustained, restart ingestor |
-| Redpanda rebalancing | Wait ~60 s for rebalancing to complete; lag should recover |
+| Postgres connection failure | Check `POSTGRES_PASSWORD` in `.env`; `make shell-db` to verify |
+| Postgres write latency | Increase `PARQUET_FLUSH_INTERVAL_S` batch window; check Postgres disk I/O |
+| Producer burst (transient) | Monitor — lag recovers automatically once burst ends |
+| Redpanda rebalancing | Wait ~60 s; lag should recover as the new leader is elected |
+| Stream profile not running | `make up-stream` |
 
-### Replay after extended downtime
+#### Replay after extended downtime
 
-If the ingestor was down long enough that messages are at risk of falling off
-the retention window, or you need to reprocess a specific time range:
+If the ingestor was down long enough that messages risk falling off the
+retention window, or you need to reprocess a time range:
 
 ```bash
-# Stop the ingestor first (required — group must be inactive to reset offsets)
+# Stop the ingestor before resetting offsets (group must be inactive)
 docker compose --profile stream stop ingestor
 
-# Reset the demand consumer group to a specific timestamp
-make replay GROUP=ingestor-demand TS=2026-09-14T08:00:00
-
-# Reset the weather consumer group
+# Reset demand + weather consumer groups to a specific timestamp
+make replay GROUP=ingestor-demand  TS=2026-09-14T08:00:00
 make replay GROUP=ingestor-weather TS=2026-09-14T08:00:00
 
-# Restart ingestor
+# Restart
 make up-stream
 ```
 
 If messages have already expired from Redpanda, use the Parquet backfill path:
 
 ```bash
-# Insert Parquet lake rows directly into raw.* (no Kafka needed)
 make backfill DATE_START=2026-09-14 DATE_END=2026-09-14
-
-# Then run the batch pipeline to propagate to staging + marts
 make worker-pipeline
 ```
 
@@ -85,127 +102,157 @@ make worker-pipeline
 
 ## FeatureDriftHigh
 
-**Expression:** `drift_score > 0.2` (fires immediately — no `for` window)
+```
+drift_score > 0.2   for: 0m  (fires immediately)
+```
 
-**What it means:** The Evidently drift score for one or more features has
-exceeded 0.2.  Scores above this threshold indicate that the distribution of
-serving features has shifted significantly relative to the training set logged
-in the Production MLflow run.
+### Symptom
 
-### Diagnosis
+Alertmanager fires with `feature="<name>"` in the label.  The Grafana
+**Data Quality** dashboard shows one or more features in orange/red.  The
+`drift_detected` column in `marts.drift_reports` is `true` for recent rows.
+The worker logs contain `drift_high` structured log events.
+
+The alert fires immediately (no `for` window) because `drift_score` is already
+a windowed statistic computed by Evidently — a single noisy data point cannot
+flip it.
+
+### Likely causes
+
+**Weather features** (`temperature_c`, `humidity_pct`, `precip_mm`):
+1. Seasonal distribution shift — expected over months; a model refresh resolves it
+2. Mock-weather server stuck returning stale/flat values
+3. Weather API schema change causing null fields to be inserted
+
+**Demand features** (`demand_lag_1h`, `demand_lag_24h`, `event_count`):
+1. Genuine demand pattern change (holiday, campaign, new market)
+2. Upstream ingestor lag — lag features populated from stale/missing Postgres rows
+3. Feature store not refreshed — batch features in Redis are stale
+
+### Diagnostic commands
 
 ```bash
-# 1. Which features are drifting?
-#    Open the UI → Drift tab, or query Prometheus:
-#    drift_score{feature="temperature_c"}
-#    drift_score{feature="demand_lag_1h"}
-#    ... etc.
+# Which features are drifting and by how much?
+# Prometheus → Graph:  drift_score   (filter by feature label)
 
-# 2. When did drift start?
-#    Look at the Drift Score over 6 h chart in the UI.
-#    Or: SELECT * FROM marts.drift_reports ORDER BY checked_at DESC LIMIT 50;
+# When did drift start?  (Grafana: Drift Score over 6 h panel)
 make shell-db
-# \c forecast
 # SELECT checked_at, feature_name, drift_score, drift_detected
 #   FROM marts.drift_reports
 #  WHERE drift_detected = true
 #  ORDER BY checked_at DESC LIMIT 20;
 
-# 3. Check the worker logs for drift_check events
+# Worker drift logs
 docker compose --profile stream logs --tail=100 worker | grep drift
+
+# Is the mock-weather server returning sensible values?
+make logs-mock-weather
+
+# Is the ingestor keeping up?  (check KafkaConsumerLagHigh first)
+docker compose --profile stream ps ingestor
 ```
 
-### Interpreting scores
+**Drift score interpretation:**
 
-| Score range | Severity | Recommended action |
+| Range | Severity | Action |
 |---|---|---|
-| 0.1 – 0.2 | Moderate | Monitor trend; no action needed |
-| 0.2 – 0.3 | Significant | Alert fires; investigate root cause |
-| > 0.3 | Severe | Auto-retrain triggers (if `AUTO_RETRAIN_ON_DRIFT=true`) |
+| 0.10 – 0.20 | Moderate | Monitor trend; no action needed |
+| 0.20 – 0.30 | Significant | Alert fires; investigate root cause |
+| > 0.30 | Severe | Auto-retrain triggers if `AUTO_RETRAIN_ON_DRIFT=true` |
 
-### Root causes
-
-**Weather features** (`temperature_c`, `humidity_pct`, `precip_mm`):
-- Seasonal shift — expected over months; model refresh resolves it
-- Mock-weather server returning stale/flat values — `make logs-mock-weather`
-- External weather API schema change — check `services/mock-weather/`
-
-**Demand features** (`demand_lag_1h`, `demand_lag_24h`, `event_count`):
-- Genuine demand pattern change (holiday, event, marketing campaign)
-- Ingestor lag causing lag features to be populated from stale data
-- Check `KafkaConsumerLagHigh` alert first
-
-### Resolution
+### Fix
 
 ```bash
-# Option A: Let auto-retrain handle it (default when AUTO_RETRAIN_ON_DRIFT=true)
-#   The worker triggers a training run in a background thread when any score
-#   exceeds RETRAIN_DRIFT_THRESHOLD (default 0.3).  A new Staging version
-#   appears in MLflow if the new model beats the current Production model.
-#   Then promote manually via the UI → Model tab → Promote.
+# Option A: let the auto-retrain loop handle it
+#   When AUTO_RETRAIN_ON_DRIFT=true (default), the worker triggers a training
+#   run in a background thread once any score exceeds RETRAIN_DRIFT_THRESHOLD
+#   (default 0.3).  A new Staging model appears in MLflow if it beats the
+#   current Production model on the holdout split.
 #
-#   Cooldown: after any retrain (drift or weekly), further drift-triggered
-#   runs are suppressed for RETRAIN_COOLDOWN_MINUTES (default 360 / 6 h).
-#   The worker logs "retrain_cooldown_active" with remaining_minutes when
-#   a trigger is rejected.  To bypass the cooldown, trigger manually:
+#   Cooldown: after any retrain (drift-triggered or weekly), further
+#   drift-triggered runs are suppressed for RETRAIN_COOLDOWN_MINUTES (default
+#   360 min / 6 h).  The worker logs "retrain_cooldown_active" with
+#   remaining_minutes when a trigger is rejected.
 
-# Option B: Trigger training manually (bypasses the cooldown)
+# Option B: trigger training manually (bypasses the cooldown)
 make train
 
-# After training completes, promote Staging → Production via the UI,
-# or force-promote the API's in-memory models:
+# After training, promote Staging → Production via the UI (Model tab → Promote)
+# or hot-reload the API's in-memory models without a restart:
 make reload
+
+# If drift is caused by stale feature store data, force a batch sync first:
+docker compose --profile core --profile stream run --rm worker \
+    python -m app.feature_store
 ```
 
 ---
 
 ## PredictionLatencyHigh
 
-**Expression:**
 ```
 histogram_quantile(0.99,
   rate(http_request_duration_seconds_bucket{path="/predict"}[5m])
-) > 0.5
+) > 0.5   for: 5m
 ```
-fires when p99 > 500 ms for 5 consecutive minutes.
 
-**What it means:** The 99th-percentile latency of the `/predict` endpoint is
-above 500 ms.  Causes are typically: Redis miss (falling back to Postgres),
-slow Postgres query, API CPU saturation, or model inference becoming slow.
+### Symptom
 
-### Diagnosis
+Alertmanager fires after the p99 `/predict` latency has been above 500 ms for
+five consecutive minutes.  The Grafana **Model Performance** dashboard shows
+a rising p99 curve.  `/health` and `/ready` remain fast; only `/predict` is
+affected (unless it's a Redis outage, which would affect all Postgres fallback
+paths).
+
+### Likely causes
+
+1. **Redis feature cache miss** — API falls back to Postgres for every request
+2. **Feature store not populated** — batch sync never ran or failed
+3. **Redis down or restarting** — full fallback to Postgres for all reads
+4. **Postgres query slow** — missing index, autovacuum, or disk pressure
+5. **API CPU saturation** — insufficient container resources
+6. **Model inference slow** — overly large model (too many features / HGB trees)
+
+### Diagnostic commands
 
 ```bash
-# 1. What is the current p99?
-#    Prometheus: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{path="/predict"}[5m]))
+# Current p99 (Prometheus)
+# histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{path="/predict"}[5m]))
 
-# 2. Check the API logs for slow request traces
+# API logs — look for slow_request or fallback_to_postgres events
 docker compose --profile core logs --tail=100 api | grep predict
 
-# 3. Is Redis healthy?
+# Is Redis healthy?
 make shell-redis
-# > PING   → expect PONG
-# > INFO server   → check uptime_in_seconds
+# > PING  → expect PONG
+# > INFO server  → check uptime_in_seconds
 
-# 4. Redis feature store miss rate
-curl -s http://localhost:8080/model/info | python3 -m json.tool | grep miss
+# Feature store miss rate and loaded_at timestamps
+curl -s http://localhost:8080/model/info | python3 -m json.tool
 
-# 5. Is the feature store populated?
-make inspect-features   # dumps all feat:route:* keys
+# Are feature keys present?
+make inspect-features   # lists all feat:route:* keys in Redis
+
+# Postgres query latency
+make shell-db
+# SELECT query, calls, mean_exec_time, max_exec_time
+#   FROM pg_stat_statements
+#  ORDER BY mean_exec_time DESC LIMIT 10;
 ```
 
-### Common causes and fixes
+### Fix
 
-| Cause | Symptoms | Fix |
-|---|---|---|
-| Redis feature miss (fallback to Postgres) | `miss_rate_pct` > 50% in /model/info | Run feature store sync: `docker compose run --rm worker python -m app.feature_store` |
-| Feature store outdated | Old `loaded_at` timestamps | Run `make worker-pipeline` then feature store sync |
-| Redis connection failure | Latency spike + Redis errors in logs | Restart Redis: `docker compose restart redis` |
-| API CPU saturation | Steady-state high latency, all endpoints slow | Scale API replicas or increase container CPU limit |
-| Model inference slow (large model) | Only /predict is slow, /health is fast | Re-train with fewer features or reduced HGB iterations |
-| Cold start / model reload | Brief spike during `make reload` | Normal; resolves in seconds |
+| Cause | Fix |
+|---|---|
+| Redis cache miss / stale features | Force sync: `docker compose --profile core --profile stream run --rm worker python -m app.feature_store` |
+| Feature store never populated | Run full pipeline first: `make worker-pipeline`, then feature store sync above |
+| Redis down | `docker compose restart redis`; feature sync will repopulate on restart |
+| Postgres query slow | `ANALYZE <table>;` or `VACUUM ANALYZE;` inside `make shell-db`; add missing index |
+| API CPU saturation | Increase `cpus` limit in docker-compose.yml api service; or scale replicas |
+| Model inference slow | Retrain with fewer features or reduced `n_estimators` in HGB |
+| Cold start after `make reload` | Brief spike (seconds); normal and self-resolving |
 
-### Force a feature-store sync
+#### Force a feature-store sync
 
 ```bash
 docker compose --profile core --profile stream run --rm worker \
@@ -216,69 +263,89 @@ docker compose --profile core --profile stream run --rm worker \
 
 ## ModelNotTrainedRecently
 
-**Expression:**
 ```
 (time() - model_last_trained_timestamp > 172800)
-or absent(model_last_trained_timestamp)
+or absent(model_last_trained_timestamp)   for: 0m
 ```
-Fires immediately when the Pushgateway metric is missing or older than 48 h.
 
-**What it means:** No successful training run has completed in the past 48
-hours (or the Pushgateway has been restarted and the metric was lost).  Stale
-models diverge from the current data distribution over time.
+### Symptom
 
-### Diagnosis
+Alertmanager fires immediately.  Either the Pushgateway metric
+`model_last_trained_timestamp` is absent (Pushgateway restarted and lost the
+gauge, or the trainer has never completed a run), or the metric exists but is
+older than 48 hours.  The Grafana **Model Performance** dashboard shows
+"Last Trained" as `N/A` or a stale timestamp.  The model in production is
+potentially diverging from the current data distribution.
+
+### Likely causes
+
+1. **Trainer job not triggered** — `make train` was never called, or the weekly cron thread in the worker hasn't fired yet
+2. **Pushgateway restarted** — the gauge is held in memory and lost on restart
+3. **MLflow unreachable** — trainer completes but cannot log or register the model
+4. **Insufficient mart data** — fewer rows than `val_days` required by the trainer; training aborts
+5. **PSI drift gate blocked promotion** — new model's feature distributions shifted too far from training set
+6. **Holdout MAE gate blocked promotion** — new model was worse than the current Production model
+
+### Diagnostic commands
 
 ```bash
-# 1. When was the last training run?
+# When was the metric last pushed?
 curl -s http://localhost:9091/metrics | grep model_last_trained
 
-# 2. Check the trainer logs
+# Trainer logs (look for errors or "promotion_rejected_*")
 docker compose --profile ml logs --tail=100 trainer
 
-# 3. Is the Pushgateway running?
+# Is the Pushgateway running?
 docker compose --profile obs ps pushgateway
 
-# 4. Is MLflow reachable?
-curl -s http://localhost:5000/health
+# Is MLflow reachable?
+curl -s http://localhost:5001/health
 
-# 5. Check model registry for recent versions
+# How many mart rows are available?
+make shell-db
+# SELECT COUNT(*) FROM marts.route_features_daily;
+
+# Registered model versions in MLflow
 curl -s http://localhost:8080/model/versions | python3 -m json.tool
+
+# Weekly auto-retrain scheduler status
+docker compose --profile stream logs --tail=20 worker | grep weekly_retrain
 ```
 
-### Common causes and fixes
+### Fix
 
 | Cause | Fix |
 |---|---|
-| Trainer job never scheduled / misconfigured | Check `make up-ml`; trainer is a one-shot service run via `make train` |
-| Pushgateway restarted (metric lost) | Run `make train` — a fresh push resets the metric |
-| MLflow unavailable during trainer run | `make up-ml`; then `make train` |
-| Insufficient mart data (`< val_days` rows) | Run `make worker-pipeline` to populate marts; then `make train` |
-| PSI drift gate blocked promotion (Gate 1) | Check trainer logs for `promotion_rejected_drift`; inspect `drift_report.json` in MLflow UI |
-| Holdout MAE gate blocked promotion (Gate 2) | New model was worse than current Production; this is expected — wait for more data or retrain |
+| Trainer never run | `make train` |
+| Pushgateway restarted (metric lost) | `make train` — a fresh run re-pushes the gauge |
+| MLflow unavailable | `make up-ml`; then `make train` |
+| Insufficient mart data | `make worker-pipeline` to populate marts; then `make train` |
+| PSI drift gate blocked promotion | Inspect `drift_report.json` in the MLflow run artifacts; if expected, `make train` after more data accumulates |
+| Holdout MAE gate blocked promotion | New model was worse; wait for more data or `make train` again |
 
-### Manual training
+#### Trigger training manually
 
 ```bash
-# Run the full train → register → promote-to-staging pipeline
+# Full train → register → promote-to-staging pipeline
 make train
 
-# After training, if the new version is in Staging, promote to Production via
-# the UI (Model tab → Promote) or force-reload the in-memory models:
+# After training completes, promote Staging → Production via the UI
+# (Model tab → Promote), or hot-reload the API's in-memory models:
 make reload
 ```
 
-### Weekly auto-retrain
+#### Weekly auto-retrain schedule
 
-The worker runs an automatic retraining job every Sunday at 04:00 UTC.
-If the Pushgateway metric is missing and it is outside that window, run
-training manually as above.
-
-To verify the weekly job is scheduled:
+The worker schedules a retrain every Sunday at 04:00 UTC regardless of drift.
+If the alert fires on a Monday and no manual `make train` has been run, verify
+the weekly job fired:
 
 ```bash
-docker compose --profile core --profile stream logs --tail=20 worker | grep weekly_retrain
+docker compose --profile stream logs worker | grep weekly_retrain
 ```
+
+If the worker was down over Sunday, run `make train` manually to reset the
+Pushgateway gauge.
 
 ---
 
@@ -291,7 +358,7 @@ make ps
 # Tail all logs
 make logs
 
-# Tail a specific service
+# Tail a single service
 make logs-worker
 make logs-api
 make logs-ingestor
@@ -302,22 +369,28 @@ make shell-db
 # Redis shell
 make shell-redis
 
-# Inspect feature store keys
+# Inspect all feature store keys in Redis
 make inspect-features
 
 # Parquet lake contents
 make lake CMD="list"
 make lake CMD="counts demand_events --last 6"
 
-# Manually trigger the batch pipeline
+# Manually run the batch pipeline (raw → staging → marts → scaler)
 make worker-pipeline
 
-# Manually trigger training
+# Manually trigger model training
 make train
 
-# Hot-reload Production + Staging models in the API
+# Hot-reload Production + Staging models in the API (no restart)
 make reload
 
 # Full infra verify (health checks + endpoint assertions)
 make verify
+
+# Reset offsets for a consumer group to a specific timestamp
+make replay GROUP=ingestor-demand TS=2026-09-14T08:00:00
+
+# Backfill Postgres raw tables from Parquet lake
+make backfill DATE_START=2026-09-14 DATE_END=2026-09-14
 ```
