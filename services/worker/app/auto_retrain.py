@@ -27,6 +27,16 @@ Training pipeline (inline, mirrors services/trainer)
 The MLflow experiment and model name match the trainer service so all runs
 appear in the same experiment view.
 
+Cooldown
+--------
+A module-level monotonic timestamp records when the last retrain was
+*started* (under the lock, so both drift and weekly runs update it).
+``maybe_trigger_retrain`` compares the elapsed time against
+``settings.retrain_cooldown_minutes`` (default 360 min / 6 h) before
+spawning a thread.  This stops a sustained-drift event from re-launching
+training on every drift-check cycle while still allowing the weekly
+maintenance run, which is governed by its own cron schedule.
+
 Idempotency / safety
 ---------------------
 - The function is wrapped in a broad try/except so scheduler failures never
@@ -63,6 +73,11 @@ log = structlog.get_logger()
 
 # Prevents simultaneous retrains from drift trigger + weekly job.
 _retrain_lock = threading.Lock()
+
+# Monotonic timestamp of when the last retrain was *started*.
+# Written under _retrain_lock; read lock-free in maybe_trigger_retrain for a
+# fast-path rejection (a concurrent run would fail at lock.acquire anyway).
+_last_retrain_triggered_at: float | None = None
 
 # ---------------------------------------------------------------------------
 # Feature schema (mirrors trainer/app/data.py)
@@ -353,10 +368,19 @@ def run_auto_retrain(settings: Settings, trigger: str = "weekly") -> None:
     Acquires _retrain_lock so concurrent drift + weekly triggers do not
     start two simultaneous training runs.  Skips silently when the lock
     is held.
+
+    Also updates _last_retrain_triggered_at under the lock so the cooldown
+    clock is reset regardless of whether the trigger was drift or weekly.
     """
+    global _last_retrain_triggered_at
+
     if not _retrain_lock.acquire(blocking=False):
         log.info("retrain_skipped", reason="retrain_already_in_progress")
         return
+
+    # Stamp the trigger time now, while we hold the lock, so any concurrent
+    # drift check that reads it gets an accurate value.
+    _last_retrain_triggered_at = time.monotonic()
 
     t0 = time.monotonic()
     log.info("retrain_started", trigger=trigger)
@@ -424,6 +448,24 @@ def maybe_trigger_retrain(
     ]
     if not exceeding:
         return
+
+    # Cooldown guard — prevent thrashing when drift stays elevated across
+    # consecutive check cycles.  The timestamp is set under _retrain_lock
+    # by run_auto_retrain, so this read is a best-effort fast-path rejection;
+    # any genuine race is caught by _retrain_lock.acquire(blocking=False).
+    if _last_retrain_triggered_at is not None:
+        elapsed_s = time.monotonic() - _last_retrain_triggered_at
+        cooldown_s = settings.retrain_cooldown_minutes * 60
+        if elapsed_s < cooldown_s:
+            remaining_m = int((cooldown_s - elapsed_s) / 60)
+            log.info(
+                "retrain_cooldown_active",
+                trigger="drift",
+                features=exceeding,
+                cooldown_minutes=settings.retrain_cooldown_minutes,
+                remaining_minutes=remaining_m,
+            )
+            return
 
     log.info(
         "retrain_drift_trigger",

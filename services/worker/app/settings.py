@@ -83,6 +83,13 @@ class Settings(BaseSettings):
     retrain_weekly_day:  str = "sun"         # day_of_week
     retrain_weekly_hour: int = 4             # hour (UTC)
 
+    # Minimum gap between any two auto-retrain runs (minutes).
+    # Prevents a sustained drift event from re-launching training on every
+    # drift-check cycle.  Both drift and weekly triggers reset the clock, so
+    # a model that was just retrained won't be retrained again simply because
+    # drift remains elevated through the cooldown window.
+    retrain_cooldown_minutes: int = 360      # 6 hours
+
     @property
     def postgres_dsn(self) -> str:
         return (

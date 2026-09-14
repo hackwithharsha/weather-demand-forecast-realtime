@@ -143,8 +143,13 @@ docker compose --profile stream logs --tail=100 worker | grep drift
 #   exceeds RETRAIN_DRIFT_THRESHOLD (default 0.3).  A new Staging version
 #   appears in MLflow if the new model beats the current Production model.
 #   Then promote manually via the UI → Model tab → Promote.
+#
+#   Cooldown: after any retrain (drift or weekly), further drift-triggered
+#   runs are suppressed for RETRAIN_COOLDOWN_MINUTES (default 360 / 6 h).
+#   The worker logs "retrain_cooldown_active" with remaining_minutes when
+#   a trigger is rejected.  To bypass the cooldown, trigger manually:
 
-# Option B: Trigger training manually
+# Option B: Trigger training manually (bypasses the cooldown)
 make train
 
 # After training completes, promote Staging → Production via the UI,
