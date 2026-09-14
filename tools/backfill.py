@@ -138,17 +138,28 @@ def _insert_partition(
     table: str,
     df: pd.DataFrame,
     dry_run: bool,
-) -> int:
+) -> tuple[int, int]:
+    """Insert rows from df into raw.<table>.
+
+    Returns (attempted, inserted) where:
+      attempted = rows in the Parquet file
+      inserted  = rows actually written (0 when all event_ids already exist)
+    """
     cols = _TABLE_COLS[table]
     rows = [_to_row(row, cols) for _, row in df.iterrows()]
     if not rows:
-        return 0
+        return 0, 0
     if dry_run:
-        return len(rows)
+        return len(rows), len(rows)
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, _INSERT_SQL[table], rows)
+        # page_size=len(rows) issues a single INSERT so cur.rowcount reflects
+        # the total number of rows actually inserted (ON CONFLICT skips = 0).
+        psycopg2.extras.execute_values(
+            cur, _INSERT_SQL[table], rows, page_size=len(rows)
+        )
+        inserted = cur.rowcount if cur.rowcount >= 0 else 0
     conn.commit()
-    return len(rows)
+    return len(rows), inserted
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +203,12 @@ def backfill(
                     df  = _download_parquet(s3, bucket, key)
                     if df is None or df.empty:
                         continue
-                    n = _insert_partition(conn, table, df, dry_run)
-                    if n:
+                    attempted, inserted = _insert_partition(conn, table, df, dry_run)
+                    if attempted:
                         total_files += 1
-                        total_rows  += n
-                        print(f"  {tag}{key}: {n} rows")
+                        total_rows  += inserted
+                        label = f"{inserted} new / {attempted} attempted"
+                        print(f"  {tag}{key}: {label} rows")
     finally:
         if conn is not None:
             conn.close()
